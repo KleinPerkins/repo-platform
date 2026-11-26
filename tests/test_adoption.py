@@ -4,6 +4,7 @@ from io import StringIO
 import json
 from pathlib import Path
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import time
 import unittest
@@ -17,6 +18,7 @@ from native_checkout_project import NativeProjectBinding
 from personal_checkout_inventory import Binding, Inventory, Refused
 from physical_checkout_binding import OwnerPhysicalBinding, OwnerPhysicalBindings, ROLES
 from repo_platform import adoption, command
+from repo_platform.adoption_results import AdoptionResults
 from repo_platform.discovery import SkillsDiscovery
 from skills_inventory_projection import guarded_admission, project_inventory, store_projection
 
@@ -227,7 +229,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(result.native_selection_digest, initial.selection_digest)
         self.assertEqual(result.warnings, ("Codex project display title changed during the preview.",))
 
-    def test_explicit_command_prints_private_owner_handoff_and_preserves_prior_result(self):
+    def command_owner(self):
         def acquire_native(project_id, checkout, *, thread_id, deadline):
             native = self.native(project_id, checkout, deadline=deadline)
             self.assertEqual(native.thread_id, thread_id)
@@ -238,8 +240,13 @@ class AdoptionTests(unittest.TestCase):
                 hosted.repository_id, hosted.full_name, "private-no-ci", "fixture-policy-revision"
             )
 
-        owner = command.OwnerSession(self.inventory, "proof", self.physical,
-                                     acquire_native, self.hosting, classify, self.index())
+        storage = self.root / "accepted"
+        storage.mkdir(mode=0o700, exist_ok=True)
+        return command.OwnerSession(self.inventory, "proof", self.physical, acquire_native,
+                                    self.hosting, classify, self.index(), AdoptionResults(storage))
+
+    def test_explicit_command_prints_private_owner_handoff_and_preserves_prior_result(self):
+        owner = self.command_owner()
         args = ["adopt", self.linked.checkout, "--project-id", "fixture-project",
                 "--thread-id", "fixture-thread", "--repository-id"]
         output, errors = StringIO(), StringIO()
@@ -253,6 +260,9 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(len(result["discovery"]["observations"]), 5)
         self.assertTrue(all(row["state"] == "current" for row in result["discovery"]["observations"]))
         self.assertEqual(errors.getvalue(), "")
+        stored, = owner.results.path.glob("adoption-*.json")
+        accepted = stored.read_bytes()
+        self.assertEqual(json.loads(accepted)["result"], result)
         with patch("repo_platform.adoption.pin_checkout") as probe:
             self.assertEqual(command.run([*args, "74"], owner=owner, output=output, errors=errors), 1)
             probe.assert_not_called()
@@ -261,11 +271,92 @@ class AdoptionTests(unittest.TestCase):
 
         with patch("repo_platform.adoption.pin_checkout") as probe:
             forbidden = replace(owner, read_delivery=lambda hosted, **_: replace(
-                classify(hosted, deadline=0), disposition="retired"
+                owner.read_delivery(hosted, deadline=0), disposition="retired"
             ))
             self.assertEqual(command.run([*args, "73"], owner=forbidden, output=output, errors=errors), 1)
             probe.assert_not_called()
         self.assertEqual(output.getvalue(), prior)
+        self.assertEqual(stored.read_bytes(), accepted)
+
+    def test_racing_command_cannot_overwrite_a_result_published_since_it_started(self):
+        owner = self.command_owner()
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        output, errors = StringIO(), StringIO()
+        winning_output = StringIO()
+
+        def publish_first(repository_id, *, deadline):
+            self.assertEqual(command.run(args, owner=owner, output=winning_output, errors=errors), 0)
+            return self.hosting(repository_id, deadline=deadline)
+
+        slower = replace(owner, read_hosting=publish_first)
+        self.assertEqual(command.run(args, owner=slower, output=output, errors=errors), 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("another command published", errors.getvalue())
+        stored, = owner.results.path.glob("adoption-*.json")
+        self.assertEqual(json.loads(stored.read_bytes())["result"], json.loads(winning_output.getvalue()))
+
+    def test_retirement_during_recheck_preserves_the_accepted_disk_result(self):
+        owner = self.command_owner()
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        output, errors = StringIO(), StringIO()
+        self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 0)
+        stored, = owner.results.path.glob("adoption-*.json")
+        accepted = stored.read_bytes()
+
+        def retire(repository_id, *, deadline):
+            self.inventory.reserve(self.version, "retirement", {self.primary.checkout: None}, deadline=deadline)
+            return self.hosting(repository_id, deadline=deadline)
+
+        output = StringIO()
+        with patch("repo_platform.adoption.pin_checkout") as probe:
+            self.assertEqual(command.run(args, owner=replace(owner, read_hosting=retire),
+                                         output=output, errors=errors), 1)
+            self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 1)
+            probe.assert_not_called()
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("Dev inventory changed", errors.getvalue())
+        self.assertIn("lifecycle change", errors.getvalue())
+        self.assertEqual(stored.read_bytes(), accepted)
+
+    def test_interrupted_publication_releases_lock_and_preserves_prior_result(self):
+        owner = self.command_owner()
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        errors = StringIO()
+        self.assertEqual(command.run(args, owner=owner, output=StringIO(), errors=errors), 0)
+        stored, = owner.results.path.glob("adoption-*.json")
+        accepted = stored.read_bytes()
+        child = subprocess.run(
+            [sys.executable, "-c", """
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import sys
+import time
+from unittest.mock import patch
+from repo_platform.adoption_results import AdoptionResults
+
+@dataclass(frozen=True)
+class Result:
+    native_selection_digest: str
+    interrupted: bool = True
+
+store = AdoptionResults(Path(sys.argv[1]))
+selection = sys.argv[2]
+with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, **kw: os._exit(79)):
+    store.publish(Result(selection), store.reference(selection), expires=time.monotonic() + 2)
+""", str(owner.results.path), json.loads(accepted)["result"]["native_selection_digest"]],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(child.returncode, 79, child.stderr)
+        self.assertEqual(stored.read_bytes(), accepted)
+        self.assertEqual(len(list(owner.results.path.glob(".*.pending"))), 1)
+        restarted = replace(owner, results=AdoptionResults(owner.results.path),
+                            inventory=Inventory(owner.inventory.directory))
+        output = StringIO()
+        self.assertEqual(command.run(args, owner=restarted, output=output, errors=errors), 0)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(list(owner.results.path.glob(".*.pending")), [])
+        self.assertEqual(json.loads(stored.read_bytes())["result"], json.loads(output.getvalue()))
 
     def test_index_joins_one_repository_and_clone_with_two_worktrees(self):
         index = self.index(optional_missing=True)

@@ -20,6 +20,12 @@ from skills_inventory_projection import linked_relationship
 MAX_OBSERVATION_AGE = 86400
 GUARDED_READ_SECONDS = 2
 COMMIT_ID = re.compile(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+OWNER_HANDOFFS = {
+    "actions-app": "repository-ci-and-reviewer-app",
+    "native-github": "repository-ci-and-reviewer-app",
+    "private-no-ci": "private-repository-owner",
+    "unenrolled": "dev-delivery-enrollment-owner",
+}
 
 
 @dataclass(frozen=True)
@@ -50,6 +56,7 @@ class AdoptionPreview:
     dev_version: tuple[str, int, str]
     owner_evidence_digest: str
     delivery: DeliveryClassification | None
+    owner_handoff: str | None
     discovery: DiscoveryEvidence | None
     warnings: tuple[str, ...]
 
@@ -109,8 +116,8 @@ def _local_head(binding, reader):
 
 def preview(inventory, checkout, project_id, owner_operation, *, physical,
             read_native, read_hosting, deadline, thread_id=None, expected_title=None,
-            expected_repository_id=None, read_delivery=None, discovery=None):
-    """Return a read-only preview; native and hosting readers belong to the caller's owner connection."""
+            expected_repository_id=None, read_delivery=None, discovery=None, results=None):
+    """Qualify one checkout and optionally record the result without changing the checkout."""
     checkout = lexical(checkout)
     selected = selection_digest(project_id, checkout, thread_id)
     raw, version = inventory.snapshot()
@@ -137,6 +144,7 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
         raise Refused("the native selection must identify the admitted primary or linked checkout")
     if not binding.linked_metadata() and binding.git_directory != checkout + "/.git":
         raise Refused("the primary checkout does not have an admitted in-place Git directory")
+    expected_result = results.reference(selected) if results is not None else None
 
     scope = inventory.current_owner_evidence(
         owner_operation, deadline=min(deadline, time.monotonic() + GUARDED_READ_SECONDS)
@@ -180,7 +188,7 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
         if (not isinstance(delivery, DeliveryClassification)
                 or delivery.repository_id != hosted.repository_id or delivery.repository_name != hosted.full_name
                 or not delivery.policy_revision
-                or delivery.disposition not in {"actions-app", "native-github", "private-no-ci", "unenrolled"}):
+                or delivery.disposition not in OWNER_HANDOFFS):
             raise Refused("Dev delivery policy does not permit a handoff for the observed repository")
         if delivery.disposition == "private-no-ci" and not hosted.private:
             raise Refused("the observed repository visibility conflicts with Dev's private delivery policy")
@@ -216,13 +224,17 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
             warnings.append("Codex project display title changed during the preview.")
         if expected_title is not None and native.title is not None and native.title != expected_title:
             warnings.append("Codex project display title differs from the selected title.")
-        return AdoptionPreview(
+        result = AdoptionPreview(
             project_id, checkout, binding.git_directory, binding.common_directory,
             hosted.repository_id, hosted.full_name, native.title, head, hosted.default_branch,
             hosted.default_head, hosted.private, native.selection_digest, native.observed_at,
-            hosted.identity_observed_at, hosted.ref_observed_at, version, scope.digest, delivery, indexed,
+            hosted.identity_observed_at, hosted.ref_observed_at, version, scope.digest, delivery,
+            OWNER_HANDOFFS[delivery.disposition] if delivery is not None else None, indexed,
             tuple(warnings),
         )
+        if results is not None:
+            results.publish(result, expected_result, expires=expires)
+        return result
 
     return inventory.read_bound(
         version, checkout, "adopt", locations, inspect,
