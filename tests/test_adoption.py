@@ -12,6 +12,7 @@ import time
 import unittest
 from unittest.mock import DEFAULT, Mock, patch
 
+import github_checkout_provider
 from github_checkout_provider import GitHubRepositoryObservation, TransientProviderRead
 from issue_checkout_evidence import issue_checkout_evidence_reissue, observe_checkout_authorities
 from lib.adapters import make_observation, typed
@@ -309,7 +310,8 @@ class AdoptionTests(unittest.TestCase):
 
     def test_lifecycle_reservation_after_native_read_stops_target_probe(self):
         def reserve_retirement(repository_id, *, deadline):
-            self.inventory.reserve(self.version, "retirement", {self.primary.checkout: None}, deadline=deadline)
+            self.inventory.reserve(self.version, "retirement",
+                                   {self.primary.checkout: None, self.linked.checkout: None}, deadline=deadline)
             return self.hosting(repository_id, deadline=deadline)
 
         with patch("repo_platform.adoption.pin_checkout") as probe:
@@ -504,7 +506,8 @@ class AdoptionTests(unittest.TestCase):
         accepted = stored.read_bytes()
 
         def retire(repository_id, *, deadline):
-            self.inventory.reserve(self.version, "retirement", {self.primary.checkout: None}, deadline=deadline)
+            self.inventory.reserve(self.version, "retirement",
+                                   {self.primary.checkout: None, self.linked.checkout: None}, deadline=deadline)
             return self.hosting(repository_id, deadline=deadline)
 
         output = StringIO()
@@ -605,6 +608,94 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
         self.assertEqual(command.run(args, owner=advanced, output=StringIO(), errors=advanced_errors),
                          0, advanced_errors.getvalue())
         self.assertFalse(case.exists())
+
+    def test_github_reset_is_honored_across_preview_and_adopt_restarts(self):
+        owner = self.command_owner()
+        args = [self.primary.checkout, "--project-id", "fixture-project"]
+
+        def run(verb, session):
+            output, errors = StringIO(), StringIO()
+            code = command.run([verb, *args], owner=session, output=output, errors=errors)
+            return code, output.getvalue(), errors.getvalue()
+
+        self.assertEqual(run("adopt", owner)[0], 0)
+        accepted, = owner.results.path.glob("adoption-*.json")
+        last_result = accepted.read_bytes()
+        snapshot = owner.discovery.cache.read_bytes()
+        reset = 400
+        quota = self.github_quota(reset)
+        hosted = Mock(side_effect=[quota, self.hosting(73, deadline=time.monotonic() + 2)])
+        native = Mock(wraps=owner.read_native)
+        owner = replace(owner, read_hosting=hosted, read_native=native)
+        clock = [100.0]
+
+        with patch.object(github_checkout_provider, "GitHubRateLimited", type(quota), create=True), patch(
+            "repo_platform.recovery.time", side_effect=lambda: clock[0]
+        ), patch("repo_platform.recovery.sleep") as wait:
+            with patch("repo_platform.adoption.pin_checkout") as target:
+                code, output, errors = run("adopt", owner)
+                self.assertEqual((code, output), (1, ""))
+                self.assertIn("1970-01-01 00:06:40 UTC", errors)
+                case, = owner.results.path.glob("recovery-*.json")
+                pending = case.read_bytes()
+                record = json.loads(pending)
+                self.assertEqual((record["kind"], record["state"], record["ready_ms"]),
+                                 ("github-rate-limit", "cooldown", reset * 1000))
+
+                restarted = replace(owner, inventory=Inventory(owner.inventory.directory),
+                                    results=AdoptionResults(owner.results.path))
+                clock[0] = reset - 1
+                self.assertEqual(run("preview", restarted)[:2], (1, ""))
+                self.assertEqual(run("adopt", restarted), (code, output, errors))
+                self.assertEqual(case.read_bytes(), pending)
+                self.assertEqual(accepted.read_bytes(), last_result)
+                self.assertEqual(owner.discovery.cache.read_bytes(), snapshot)
+                self.assertEqual((hosted.call_count, native.call_count), (1, 1))
+                target.assert_not_called()
+
+            clock[0] = reset
+            code, output, errors = run("adopt", restarted)
+            self.assertEqual(code, 0, errors)
+            self.assertEqual(json.loads(output)["repository_id"], 73)
+            self.assertEqual((hosted.call_count, native.call_count), (2, 3))
+            self.assertFalse(case.exists())
+        wait.assert_not_called()
+
+    def test_github_throttle_without_future_reset_requires_diagnosis(self):
+        for reset in (None, 99):
+            with self.subTest(reset=reset):
+                owner = self.command_owner()
+                args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+                quota = self.github_quota(reset)
+                hosted = Mock(side_effect=quota)
+                owner = replace(owner, read_hosting=hosted)
+                errors = StringIO()
+                with patch.object(github_checkout_provider, "GitHubRateLimited", type(quota), create=True), patch(
+                    "repo_platform.recovery.time", return_value=100
+                ), patch("repo_platform.recovery.sleep") as wait, patch("repo_platform.adoption.pin_checkout") as target:
+                    for _ in range(2):
+                        self.assertEqual(command.run(args, owner=owner, output=StringIO(), errors=errors), 1)
+                self.assertIn("Codex diagnosis required", errors.getvalue())
+                self.assertIn("Dev public GitHub reader", errors.getvalue())
+                hosted.assert_called_once()
+                target.assert_not_called()
+                wait.assert_not_called()
+                case, = owner.results.path.glob("recovery-*.json")
+                record = json.loads(case.read_bytes())
+                self.assertEqual((record["kind"], record["state"]), ("github-rate-limit", "diagnose"))
+                case.unlink()
+
+    @staticmethod
+    def github_quota(reset):
+        class FixtureRateLimit(Refused):
+            def __init__(self, status, retry_at):
+                self.retry_at = retry_at
+                message = f"GitHub rate limit reached (HTTP {status})."
+                if retry_at is not None:
+                    message += f" Retry after {datetime.fromtimestamp(retry_at, timezone.utc):%Y-%m-%d %H:%M:%S UTC}."
+                super().__init__(message)
+
+        return getattr(github_checkout_provider, "GitHubRateLimited", FixtureRateLimit)(403, reset)
 
     def test_read_only_preview_retries_transient_reads_without_a_recovery_record(self):
         owner = self.command_owner()
@@ -886,7 +977,7 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
         real_refresh = repair.refresh
 
         def reserve_before_refresh(*args, **kwargs):
-            self.inventory.reserve(self.version, "retirement", {self.primary.checkout: None},
+            self.inventory.reserve(self.version, "retirement", {self.primary.checkout: None, self.linked.checkout: None},
                                    deadline=time.monotonic() + 2)
             return real_refresh(*args, **kwargs)
 
@@ -909,7 +1000,7 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
 
         def reserve_during_backoff(delay):
             clock[0] += delay
-            self.inventory.reserve(self.version, "retirement", {self.primary.checkout: None},
+            self.inventory.reserve(self.version, "retirement", {self.primary.checkout: None, self.linked.checkout: None},
                                    deadline=time.monotonic() + 2)
 
         errors = StringIO()

@@ -32,3 +32,10 @@ successful adoption. If required discovery evidence is stale, the configured
 Skills owner can refresh it during adoption. A failed adoption preserves the
 previous accepted record. Each repository's owners govern source changes,
 review, merge and release.
+
+If GitHub throttles a public repository read and reports a reset time,
+`adopt` saves that time privately. Subsequent previews and adoption attempts
+for the same selection report the wait without contacting GitHub or opening
+the checkout. At the reported time, run the command again to recheck the
+evidence. If GitHub supplies no usable future reset, adoption records a case
+for Codex to diagnose through Dev's public GitHub reader.

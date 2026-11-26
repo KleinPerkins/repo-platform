@@ -13,7 +13,9 @@ from physical_checkout_binding import OwnerPhysicalBindings
 from repo_platform.adoption import preview
 from repo_platform.adoption_results import AdoptionResults
 from repo_platform.discovery import SkillsDiscovery
-from repo_platform.recovery import DiscoveryRepairRequired, RecoveryCase, read_only_preview
+from repo_platform.recovery import (
+    DiscoveryRepairRequired, GitHubResetPending, RecoveryCase, check_github_cooldown, read_only_preview,
+)
 from repo_platform.skills_repair import SkillsRepair
 
 
@@ -64,13 +66,25 @@ def run(argv, *, owner: OwnerSession, output=None, errors=None):
             )
 
         if args.command == "preview":
-            result = read_only_preview(verify)
+            def verify_preview(deadline):
+                def begin_attempt(_version):
+                    if isinstance(owner.results, AdoptionResults):
+                        selected = selection_digest(args.project_id, args.checkout, args.thread_id)
+                        check_github_cooldown(owner.results.path, selected)
+                    return deadline
+
+                return verify(deadline, begin_attempt)
+
+            result = read_only_preview(verify_preview)
         else:
             result = _adopt(owner, args, verify)
     except DiscoveryRepairRequired as error:
         print(f"Checkout preview could not qualify discovery. {error}. "
               "Run adopt to request a refresh through the Skills owner.",
               file=errors if errors is not None else sys.stderr)
+        return 1
+    except GitHubResetPending as error:
+        print(f"Checkout is waiting for GitHub. {error}", file=errors if errors is not None else sys.stderr)
         return 1
     except Refused as error:
         operation = "preview" if args.command == "preview" else "adoption"

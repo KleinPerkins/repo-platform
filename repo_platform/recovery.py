@@ -5,12 +5,13 @@ import os
 import re
 from time import monotonic, sleep, time
 
+import github_checkout_provider
 from github_checkout_provider import TransientProviderRead
 from lib.contracts import Refusal, encode, json_load
-from lib.io_safe import read_at
+from lib.io_safe import directory, outside_repositories, private_dir, read_at
 from lib.receipt_store import AdmittedPublisher
 from personal_checkout_inventory import Refused
-from repo_platform.adoption_results import replace_private_record
+from repo_platform.adoption_results import SELECTION_DIGEST, replace_private_record
 
 
 BUDGET_SECONDS = 90
@@ -46,8 +47,60 @@ class DiagnosisRequired(Refused):
     """The case needs Codex diagnosis before another automatic attempt."""
 
 
+class GitHubResetPending(Refused):
+    """The selection is waiting for GitHub's reported reset time."""
+
+
 def clock_ms():
     return int(time() * MILLISECONDS)
+
+
+def recovery_name(selection):
+    if not SELECTION_DIGEST.fullmatch(selection):
+        raise Refused("invalid native selection digest for the private adoption recovery record")
+    return f"recovery-{selection}.json"
+
+
+def require_github_reset(record):
+    if record is not None and record["state"] == "cooldown" and clock_ms() < record["ready_ms"]:
+        raise GitHubResetPending(record["reason"])
+
+
+def check_github_cooldown(path, selection):
+    """Read this selection's known reset time without opening a publisher."""
+    parent = os.fspath(path)
+    try:
+        outside_repositories(parent)
+        with directory(parent) as fd:
+            private_dir(fd)
+            require_github_reset(load_record(fd, recovery_name(selection)))
+    except (Refusal, OSError) as error:
+        raise Refused("the private adoption recovery record could not be read safely") from error
+
+
+def load_record(fd, name):
+    try:
+        os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    record = json_load(read_at(fd, name, CASE_LIMIT, True), CASE_LIMIT)
+    if (not isinstance(record, dict) or record.get("schema") != SCHEMA
+            or not isinstance(record.get("evidence"), dict)
+            or any(type(record.get(field)) is not int for field in ("started_ms", "ready_ms"))
+            or type(record.get("attempts")) is not int or not 0 <= record["attempts"] <= MAX_ATTEMPTS
+            or record.get("state") not in ("ready", "attempting", "retry", "diagnose", "cooldown")
+            or record.get("kind") not in ("interrupted", "hosting-transport", "native-transport",
+                                          "skills-refresh", "skills-conflict", "github-rate-limit")
+            or not isinstance(record.get("reason"), str)):
+        raise Refused("the private adoption recovery record could not be validated")
+    if record["kind"] == "skills-conflict" and any(
+            not isinstance(record.get(key), str) or re.fullmatch(r"[a-f0-9]{64}", record[key]) is None
+            for key in ("material_digest", "failed_snapshot")):
+        raise Refused("the private adoption recovery record could not be validated")
+    if record["state"] == "cooldown" and (
+            record["kind"] != "github-rate-limit" or record["ready_ms"] <= record["started_ms"]):
+        raise Refused("the private adoption recovery record has an invalid GitHub reset")
+    return record
 
 
 def read_only_preview(verify):
@@ -70,7 +123,7 @@ def read_only_preview(verify):
 class RecoveryCase:
     def __init__(self, directory, selection, projection, skills_revision, operation, refreshed_snapshot):
         self.directory = os.fspath(directory)
-        self.name = f"recovery-{selection}.json"
+        self.name = recovery_name(selection)
         self.projection = projection
         self.skills_revision = skills_revision
         self.operation = operation
@@ -99,9 +152,12 @@ class RecoveryCase:
                         self.require_diagnosis()
                     except DiscoveryRepairRequired as error:
                         self.handle_discovery_failure(error, repair_skills)
-                    except DiagnosisRequired:
+                    except (DiagnosisRequired, GitHubResetPending):
                         raise
-                    except Refused:
+                    except Refused as error:
+                        # The hosted CI compatibility pin predates this owner signal.
+                        if isinstance(error, getattr(github_checkout_provider, "GitHubRateLimited", ())):
+                            self.record_github_limit(error)
                         self.finish()
                         raise
                     else:
@@ -120,7 +176,11 @@ class RecoveryCase:
         if self.slot is None:
             path = os.path.join(self.directory, self.name)
             self.slot = self.resources.enter_context(AdmittedPublisher(path, CASE_LIMIT))
-            self.record = self.load()
+            self.record = load_record(self.slot.fd, self.slot.name)
+        require_github_reset(self.record)
+        if self.record is not None and self.record["state"] == "cooldown":
+            # An explicit reset starts a new bounded verification window.
+            self.record = None
         evidence = {"dev_version": list(version), "projection_digest": self.projection.manifest_digest(),
                     "skills_revision": self.skills_revision,
                     "owner_operation": self.operation}
@@ -161,6 +221,17 @@ class RecoveryCase:
         self.save()
         return attempt_deadline
 
+    def record_github_limit(self, error):
+        if self.record is None:
+            raise DiagnosisRequired(str(error)) from error
+        self.record.update(kind="github-rate-limit", reason=str(error))
+        retry_at = error.retry_at
+        if type(retry_at) is not int or retry_at * MILLISECONDS <= clock_ms():
+            self.require_diagnosis()
+        self.record.update(state="cooldown", ready_ms=retry_at * MILLISECONDS)
+        self.save()
+        raise GitHubResetPending(str(error)) from error
+
     def record_transport_failure(self, error, *, kind):
         if self.record is None:
             raise DiagnosisRequired(str(error))
@@ -199,33 +270,13 @@ class RecoveryCase:
             self.record["state"] = "diagnose"
             self.save()
         owners = {"skills-refresh": "Skills refresh owner", "skills-conflict": "Skills source owner",
-                  "native-transport": "Codex Desktop project connection"}
+                  "native-transport": "Codex Desktop project connection",
+                  "github-rate-limit": "Dev public GitHub reader"}
         owner = owners.get(self.record["kind"], "Dev owner session")
         raise DiagnosisRequired(
             f"Codex diagnosis required after {self.record['attempts']} attempt(s). "
             f"{self.record['reason']} Check current evidence through the {owner}."
         )
-
-    def load(self):
-        try:
-            os.stat(self.slot.name, dir_fd=self.slot.fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return None
-        record = json_load(read_at(self.slot.fd, self.slot.name, CASE_LIMIT, True), CASE_LIMIT)
-        if (not isinstance(record, dict) or record.get("schema") != SCHEMA
-                or not isinstance(record.get("evidence"), dict)
-                or any(type(record.get(field)) is not int for field in ("started_ms", "ready_ms"))
-                or type(record.get("attempts")) is not int or not 0 <= record["attempts"] <= MAX_ATTEMPTS
-                or record.get("state") not in ("ready", "attempting", "retry", "diagnose")
-                or record.get("kind") not in ("interrupted", "hosting-transport", "native-transport",
-                                              "skills-refresh", "skills-conflict")
-                or not isinstance(record.get("reason"), str)):
-            raise Refused("the private adoption recovery record could not be validated")
-        if record["kind"] == "skills-conflict" and any(
-                not isinstance(record.get(key), str) or re.fullmatch(r"[a-f0-9]{64}", record[key]) is None
-                for key in ("material_digest", "failed_snapshot")):
-            raise Refused("the private adoption recovery record could not be validated")
-        return record
 
     def save(self):
         self.record["elapsed_ms"] = max(0, clock_ms() - self.record["started_ms"])
