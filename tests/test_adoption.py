@@ -1,4 +1,6 @@
 from dataclasses import replace
+from io import StringIO
+import json
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
@@ -11,7 +13,7 @@ from issue_checkout_evidence import issue_checkout_evidence_reissue, observe_che
 from native_checkout_project import NativeProjectBinding
 from personal_checkout_inventory import Binding, Inventory, Refused
 from physical_checkout_binding import OwnerPhysicalBinding, OwnerPhysicalBindings, ROLES
-from repo_platform import adoption
+from repo_platform import adoption, command
 
 
 HOSTED_HEAD = "ace0" * 10
@@ -120,7 +122,7 @@ class AdoptionTests(unittest.TestCase):
         with patch.object(adoption, "pin_checkout", wraps=adoption.pin_checkout) as probe:
             self.select(self.primary.checkout, read_native=native, read_hosting=hosting)
             probe.assert_called_once()
-        native.assert_called_once()
+        self.assertEqual(native.call_count, 2)
         hosting.assert_called_once()
 
     def test_invoked_provider_cannot_substitute_another_repository(self):
@@ -133,14 +135,13 @@ class AdoptionTests(unittest.TestCase):
             probe.assert_not_called()
 
     def test_lifecycle_reservation_after_native_read_stops_target_probe(self):
-        def reserve_retirement(project_id, checkout, *, deadline):
-            result = self.native(project_id, checkout, deadline=deadline)
-            self.inventory.reserve(self.version, "retirement", {checkout: None}, deadline=deadline)
-            return result
+        def reserve_retirement(repository_id, *, deadline):
+            self.inventory.reserve(self.version, "retirement", {self.primary.checkout: None}, deadline=deadline)
+            return self.hosting(repository_id, deadline=deadline)
 
         with patch("repo_platform.adoption.pin_checkout") as probe:
             with self.assertRaisesRegex(Refused, "Dev inventory changed"):
-                self.select(self.primary.checkout, read_native=reserve_retirement)
+                self.select(self.primary.checkout, read_hosting=reserve_retirement)
             with self.assertRaisesRegex(Refused, "lifecycle change"):
                 self.select(self.primary.checkout)
             probe.assert_not_called()
@@ -163,3 +164,58 @@ class AdoptionTests(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(Refused, "fresh"):
                         self.select(self.primary.checkout, read_hosting=dated_host)
+
+    def test_native_recheck_rejects_reassignment_before_access(self):
+        initial = self.native("fixture-project", self.primary.checkout, deadline=time.monotonic() + 3)
+        moved = replace(initial, checkout=str(self.root / "moved"))
+        samples = Mock(side_effect=[initial, moved])
+        with patch("repo_platform.adoption.pin_checkout") as probe:
+            with self.assertRaisesRegex(Refused, "native project no longer"):
+                self.select(self.primary.checkout, read_native=samples)
+            probe.assert_not_called()
+        self.assertEqual(samples.call_count, 2)
+
+    def test_native_recheck_accepts_a_change_to_the_display_title(self):
+        initial = self.native("fixture-project", self.primary.checkout, deadline=time.monotonic() + 3)
+        renamed = replace(initial, title="Sample Product")
+        result = self.select(self.primary.checkout, read_native=Mock(side_effect=[initial, renamed]))
+        self.assertEqual(result.project_title, "Sample Product")
+        self.assertEqual(result.native_selection_digest, initial.selection_digest)
+        self.assertEqual(result.warnings, ("Codex project display title changed during the preview.",))
+
+    def test_explicit_command_prints_private_owner_handoff_and_preserves_prior_result(self):
+        def acquire_native(project_id, checkout, *, thread_id, deadline):
+            native = self.native(project_id, checkout, deadline=deadline)
+            self.assertEqual(native.thread_id, thread_id)
+            return native
+
+        def classify(hosted, *, deadline):
+            return adoption.DeliveryClassification(
+                hosted.repository_id, hosted.full_name, "private-no-ci", "fixture-policy-revision"
+            )
+
+        owner = command.OwnerSession(self.inventory, "proof", self.physical,
+                                     acquire_native, self.hosting, classify)
+        args = ["adopt", self.linked.checkout, "--project-id", "fixture-project",
+                "--thread-id", "fixture-thread", "--repository-id"]
+        output, errors = StringIO(), StringIO()
+        self.assertEqual(command.run([*args, "73"], owner=owner, output=output, errors=errors), 0)
+        prior = output.getvalue()
+        result = json.loads(prior)
+        self.assertEqual(result["owner_handoff"], "private-repository-owner")
+        self.assertEqual(result["delivery"]["disposition"], "private-no-ci")
+        self.assertEqual(result["checkout"], self.linked.checkout)
+        self.assertEqual(errors.getvalue(), "")
+        with patch("repo_platform.adoption.pin_checkout") as probe:
+            self.assertEqual(command.run([*args, "74"], owner=owner, output=output, errors=errors), 1)
+            probe.assert_not_called()
+        self.assertEqual(output.getvalue(), prior)
+        self.assertIn("requested repository ID differs", errors.getvalue())
+
+        with patch("repo_platform.adoption.pin_checkout") as probe:
+            forbidden = replace(owner, read_delivery=lambda hosted, **_: replace(
+                classify(hosted, deadline=0), disposition="retired"
+            ))
+            self.assertEqual(command.run([*args, "73"], owner=forbidden, output=output, errors=errors), 1)
+            probe.assert_not_called()
+        self.assertEqual(output.getvalue(), prior)

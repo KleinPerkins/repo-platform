@@ -22,6 +22,14 @@ COMMIT_ID = re.compile(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
 @dataclass(frozen=True)
+class DeliveryClassification:
+    repository_id: int
+    repository_name: str
+    disposition: str
+    policy_revision: str
+
+
+@dataclass(frozen=True)
 class AdoptionPreview:
     project_id: str
     checkout: str
@@ -34,8 +42,13 @@ class AdoptionPreview:
     hosted_default_branch: str
     hosted_default_head: str
     private: bool
+    native_selection_digest: str
+    native_observed_at: int
+    hosting_identity_observed_at: int
+    hosting_ref_observed_at: int
     dev_version: tuple[str, int, str]
     owner_evidence_digest: str
+    delivery: DeliveryClassification | None
     warnings: tuple[str, ...]
 
 
@@ -93,7 +106,8 @@ def _local_head(binding, reader):
 
 
 def preview(inventory, checkout, project_id, owner_operation, *, physical,
-            read_native, read_hosting, deadline, thread_id=None, expected_title=None):
+            read_native, read_hosting, deadline, thread_id=None, expected_title=None,
+            expected_repository_id=None, read_delivery=None):
     """Return a read-only preview; native and hosting readers belong to the caller's owner connection."""
     checkout = lexical(checkout)
     selected = selection_digest(project_id, checkout, thread_id)
@@ -112,6 +126,10 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
     )
     if binding.provider != "github":
         raise Refused("the selected checkout has no supported hosting provider")
+    if expected_repository_id is not None and (
+        type(expected_repository_id) is not int or binding.repository_id != expected_repository_id
+    ):
+        raise Refused("the requested repository ID differs from Dev's selected checkout binding")
     if bool(binding.linked_metadata()) != (thread_id is not None):
         raise Refused("the native selection must identify the admitted primary or linked checkout")
     if not binding.linked_metadata() and binding.git_directory != checkout + "/.git":
@@ -137,18 +155,41 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
     proof = proofs.find(binding)
     config = config_proof(owner)
 
-    native = read_native(project_id, checkout, deadline=deadline)
-    if not isinstance(native, NativeProjectBinding) or native.selection_digest != selected:
-        raise Refused("the native project no longer identifies the selected checkout")
+    def observe_native():
+        observation = read_native(project_id, checkout, deadline=deadline)
+        if not isinstance(observation, NativeProjectBinding) or observation.selection_digest != selected:
+            raise Refused("the native project no longer identifies the selected checkout")
+        if not _fresh(observation.observed_at, int(time.time())):
+            raise Refused("a fresh native project observation is required")
+        return observation
+
+    initial_native = observe_native()
     hosted = read_hosting(binding.repository_id, deadline=deadline)
     if (not isinstance(hosted, GitHubRepositoryObservation)
             or hosted.repository_id != binding.repository_id
+            or not isinstance(hosted.full_name, str)
             or hosted.full_name.casefold() != owner["github_name"].casefold()):
         raise Refused("the hosting identity differs from Dev's selected checkout binding")
 
+    delivery = None
+    if read_delivery is not None:
+        delivery = read_delivery(hosted, deadline=deadline)
+        if (not isinstance(delivery, DeliveryClassification)
+                or delivery.repository_id != hosted.repository_id or delivery.repository_name != hosted.full_name
+                or not delivery.policy_revision
+                or delivery.disposition not in {"actions-app", "native-github", "private-no-ci", "unenrolled"}):
+            raise Refused("Dev delivery policy does not permit a handoff for the observed repository")
+        if delivery.disposition == "private-no-ci" and not hosted.private:
+            raise Refused("the observed repository visibility conflicts with Dev's private delivery policy")
+
+    native = observe_native()
+    if native.observed_at < initial_native.observed_at:
+        raise Refused("the native project recheck returned an earlier observation")
+
     def inspect(admitted, expires):
         now = int(time.time())
-        times = (native.observed_at, hosted.identity_observed_at, hosted.ref_observed_at,
+        times = (initial_native.observed_at, native.observed_at,
+                 hosted.identity_observed_at, hosted.ref_observed_at,
                  *(owner[name] for name in SOURCE_READ_TIMES))
         if not all(_fresh(observed, now) for observed in times):
             raise Refused("fresh owner, native, and hosting observations are required")
@@ -160,13 +201,16 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
                 raise Refused("the local HEAD changed during the preview")
             verify_git_config(admitted, reader, config)
             linked_relationship(admitted, reader)
-        warnings = ()
+        warnings = []
+        if native.title != initial_native.title:
+            warnings.append("Codex project display title changed during the preview.")
         if expected_title is not None and native.title is not None and native.title != expected_title:
-            warnings = ("Codex project display title differs from the selected title.",)
+            warnings.append("Codex project display title differs from the selected title.")
         return AdoptionPreview(
             project_id, checkout, binding.git_directory, binding.common_directory,
             hosted.repository_id, hosted.full_name, native.title, head, hosted.default_branch,
-            hosted.default_head, hosted.private, version, scope.digest, warnings,
+            hosted.default_head, hosted.private, native.selection_digest, native.observed_at,
+            hosted.identity_observed_at, hosted.ref_observed_at, version, scope.digest, delivery, tuple(warnings),
         )
 
     return inventory.read_bound(
