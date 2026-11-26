@@ -309,6 +309,40 @@ class AdoptionTests(unittest.TestCase):
         stored, = owner.results.path.glob("adoption-*.json")
         self.assertEqual(json.loads(stored.read_bytes())["result"]["warnings"], list(winner[0].warnings))
 
+    def test_changed_delivery_policy_preserves_the_previous_adoption(self):
+        owner = self.command_owner()
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        result, errors = StringIO(), StringIO()
+        self.assertEqual(command.run(args, owner=owner, output=result, errors=errors), 0)
+        accepted, = owner.results.path.glob("adoption-*.json")
+        previous = accepted.read_bytes()
+        stale = owner.read_delivery(self.hosting(73, deadline=0), deadline=0)
+        changed = replace(stale, policy_revision="new-policy")
+        reader = Mock(side_effect=[stale, changed])
+        output, errors = StringIO(), StringIO()
+        status = command.run(args, owner=replace(owner, read_delivery=reader), output=output, errors=errors)
+        self.assertEqual(status, 1)
+        self.assertEqual(reader.call_count, 2)
+        self.assertIn("delivery policy changed", errors.getvalue())
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(accepted.read_bytes(), previous)
+
+    def test_public_delivery_routes_refuse_a_private_hosted_repository(self):
+        owner = self.command_owner()
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        for disposition in ("actions-app", "native-github"):
+            with self.subTest(disposition=disposition):
+                observed = owner.read_delivery(self.hosting(73, deadline=0), deadline=0)
+                reader = Mock(return_value=replace(observed, disposition=disposition))
+                output, errors = StringIO(), StringIO()
+                with patch.object(adoption, "pin_checkout", wraps=adoption.pin_checkout) as probe:
+                    status = command.run(args, owner=replace(owner, read_delivery=reader), output=output, errors=errors)
+                    probe.assert_not_called()
+                self.assertEqual(status, 1)
+                self.assertIn("visibility conflicts", errors.getvalue())
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(list(owner.results.path.glob("adoption-*.json")), [])
+
     def test_retirement_during_recheck_preserves_the_accepted_disk_result(self):
         owner = self.command_owner()
         args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]

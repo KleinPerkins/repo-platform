@@ -193,8 +193,9 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
                 or not delivery.policy_revision
                 or delivery.disposition not in OWNER_HANDOFFS):
             raise Refused("Dev delivery policy does not permit a handoff for the observed repository")
-        if delivery.disposition == "private-no-ci" and not hosted.private:
-            raise Refused("the observed repository visibility conflicts with Dev's private delivery policy")
+        if (delivery.disposition in {"actions-app", "native-github", "private-no-ci"}
+                and hosted.private != (delivery.disposition == "private-no-ci")):
+            raise Refused("the observed repository visibility conflicts with Dev's delivery policy")
 
     native = observe_native()
     if native.observed_at < initial_native.observed_at:
@@ -235,6 +236,8 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
             OWNER_HANDOFFS[delivery.disposition] if delivery is not None else None, indexed,
             tuple(warnings),
         )
+        if delivery is not None and read_delivery(hosted, deadline=expires) != delivery:
+            raise Refused("Dev delivery policy changed during checkout adoption; rerun with current evidence")
         if results is not None:
             results.publish(result, expected_result, expires=expires)
         return result
