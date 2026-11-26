@@ -4,11 +4,39 @@
     "exclude": [],
     "include": [
       "test_*.py",
-      "tests/**/*",
-      "Tests/**/*"
+      "tests/**/*"
     ]
   },
   "schema": "dev-test-sharding/v1",
-  "shards": [],
-  "state": "pending"
+  "shards": [
+    {
+      "command": [
+        "python3",
+        "-I",
+        "-B",
+        "scripts/run-source-shard.py",
+        "adoption"
+      ],
+      "id": "adoption",
+      "tests": [
+        "tests/test_foundation_identity.py"
+      ],
+      "timeout_seconds": 120
+    },
+    {
+      "command": [
+        "python3",
+        "-I",
+        "-B",
+        "scripts/run-source-shard.py",
+        "recovery"
+      ],
+      "id": "recovery",
+      "tests": [
+        "tests/test_ci_admission.py"
+      ],
+      "timeout_seconds": 120
+    }
+  ],
+  "state": "configured"
 }

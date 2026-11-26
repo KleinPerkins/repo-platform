@@ -1,0 +1,18 @@
+{
+  "schema": "repo-platform-ci-contract/v1",
+  "repository_id": 1472074383,
+  "repository_names": [
+    "KleinPerkins/repo-platform"
+  ],
+  "workflow": ".github/workflows/ci.yml",
+  "workflow_name": "CI",
+  "required_check": "ci-required",
+  "actions_app_id": 15368,
+  "reviewer_app_id": 4217367,
+  "dev_revision": "a74471e4692919970a7df54ab01534fe74e6c81a",
+  "skills_revision": "a6f797c28fa1f6ef602b78e9c5d8ac871f781755",
+  "case_floors": {
+    "adoption": 4,
+    "recovery": 6
+  }
+}

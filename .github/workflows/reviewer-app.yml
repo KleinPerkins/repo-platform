@@ -1,0 +1,63 @@
+{
+  "name": "Reviewer App",
+  "on": {
+    "workflow_dispatch": {}
+  },
+  "permissions": {
+    "contents": "read",
+    "actions": "read",
+    "checks": "read",
+    "pull-requests": "read"
+  },
+  "concurrency": {
+    "group": "g1-reviewer-app",
+    "cancel-in-progress": false
+  },
+  "jobs": {
+    "admit": {
+      "if": "github.repository_id == '1472074383' && github.repository == 'KleinPerkins/repo-platform' && github.ref == 'refs/heads/main'",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 15,
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "ref": "${{ github.workflow_sha }}",
+            "persist-credentials": false,
+            "sparse-checkout": "scripts/reviewer_app.py\n.github/review-enrollments.json\n",
+            "sparse-checkout-cone-mode": false
+          }
+        },
+        {
+          "name": "Mint read-only repository App qualification token",
+          "if": "vars.REVIEWER_APP_QUALIFY == 'true' && vars.REVIEWER_APP_ENABLED != 'true'",
+          "id": "qualification",
+          "uses": "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
+          "with": {
+            "app-id": "4217367",
+            "private-key": "${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}",
+            "owner": "KleinPerkins",
+            "repositories": "${{ github.event.repository.name }}",
+            "permission-contents": "read",
+            "permission-pull-requests": "read",
+            "skip-token-revoke": false
+          }
+        },
+        {
+          "name": "Qualify merged-main CI, live App identity, scope and controls",
+          "env": {
+            "APP_TOKEN": "${{ steps.qualification.outputs.token }}",
+            "APP_SLUG": "${{ steps.qualification.outputs.app-slug }}",
+            "APP_INSTALLATION_ID": "${{ steps.qualification.outputs.installation-id }}",
+            "CI_READ_TOKEN": "${{ github.token }}",
+            "TRUSTED_WORKFLOW_SHA": "${{ github.workflow_sha }}",
+            "REVIEWER_APP_QUALIFY": "${{ vars.REVIEWER_APP_QUALIFY }}",
+            "REVIEWER_APP_ENABLED": "${{ vars.REVIEWER_APP_ENABLED }}",
+            "QUALIFICATION_STAGE": "current"
+          },
+          "run": "python3 -I -B scripts/reviewer_app.py --qualify-app --qualification-stage \"$QUALIFICATION_STAGE\""
+        }
+      ]
+    }
+  }
+}
