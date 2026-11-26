@@ -15,7 +15,7 @@ from unittest.mock import DEFAULT, Mock, patch
 from github_checkout_provider import GitHubRepositoryObservation, TransientProviderRead
 from issue_checkout_evidence import issue_checkout_evidence_reissue, observe_checkout_authorities
 from lib.contracts import Refusal as SkillsRefusal, encode
-from lib.engine import refresh_admitted
+from lib.engine import git_records, refresh_admitted
 from native_checkout_project import NativeProjectBinding
 from personal_checkout_inventory import Binding, Inventory, Refused
 from physical_checkout_binding import OwnerPhysicalBinding, OwnerPhysicalBindings, ROLES
@@ -631,6 +631,77 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
         self.assertEqual(json.loads(output.getvalue())["discovery"]["snapshot_generation"], 2)
         self.assertNotEqual(index.cache.read_bytes(), old)
         self.assertEqual(list(owner.results.path.glob("recovery-*.json")), [])
+
+    def test_owner_refresh_recovers_an_old_required_observation_in_a_fresh_snapshot(self):
+        required = (
+            ("location", "inventory/primary/git/common/config"),
+            ("location", "inventory/primary/git/worktree"),
+            ("identity", "inventory/primary/git/common/config"),
+        )
+        for number, (field, pointer) in enumerate(required):
+            with self.subTest(field=field, pointer=pointer):
+                unconfigured = self.root / f"without-refresh-{number}"
+                configured = self.root / f"with-refresh-{number}"
+                for slot in (unconfigured, configured):
+                    slot.mkdir(mode=0o700)
+                selection = replace(self.command_owner(), results=AdoptionResults(unconfigured))
+                args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+                previous = StringIO()
+                self.assertEqual(command.run(args, owner=selection, output=previous, errors=StringIO()), 0)
+                accepted, = selection.results.path.glob("adoption-*.json")
+                original_result = accepted.read_bytes()
+
+                def record_old_observation(*args, **kwargs):
+                    digest, entities, reused = git_records(*args, **kwargs)
+                    old = (datetime.now(timezone.utc) - timedelta(seconds=86401)).isoformat()
+                    for entity in entities:
+                        if field == "location" and entity["kind"] not in {"clone", "worktree"}:
+                            continue
+                        for item in entity["observations"]:
+                            if (item["field"], item["pointer"]) == (field, pointer):
+                                item["observed_at"] = old
+                    return digest, entities, reused
+
+                with patch("lib.engine.git_records", side_effect=record_old_observation):
+                    index = self.index()
+                snapshot = json.loads(index.cache.read_bytes())
+                generation = snapshot["generation"]
+                now = datetime.now(timezone.utc)
+                self.assertLess((now - datetime.fromisoformat(snapshot["observed_at"])).total_seconds(), 60)
+                expired = [item for entity in snapshot["entities"] for item in entity["observations"]
+                           if (item["field"], item["pointer"]) == (field, pointer)
+                           and (now - datetime.fromisoformat(item["observed_at"])).total_seconds() > 86400]
+                self.assertEqual(len(expired), 1)
+
+                with patch("repo_platform.adoption.pin_checkout") as probe:
+                    output, errors = StringIO(), StringIO()
+                    self.assertEqual(command.run(args, owner=replace(selection, discovery=index),
+                                                 output=output, errors=errors), 1)
+                    probe.assert_not_called()
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(accepted.read_bytes(), original_result)
+                self.assertIn("Check current evidence through the Skills refresh owner", errors.getvalue())
+                recovery, = selection.results.path.glob("recovery-*.json")
+                case = json.loads(recovery.read_bytes())
+                self.assertEqual(case["kind"], "skills-refresh")
+                self.assertTrue(case["failed_snapshot"])
+
+                owner = replace(selection, discovery=index, results=AdoptionResults(configured),
+                                skills_repair=SkillsRepair(self.index_settings(), self.root / "authority"))
+                host_reader = Mock(wraps=owner.read_hosting)
+                native_reader = Mock(wraps=owner.read_native)
+                owner = replace(owner, read_hosting=host_reader, read_native=native_reader)
+                output, errors = StringIO(), StringIO()
+                with patch("repo_platform.skills_repair.refresh_admitted", wraps=refresh_admitted) as refresh:
+                    self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 0,
+                                     errors.getvalue())
+                    refresh.assert_called_once()
+                self.assertEqual(host_reader.call_count, 2)
+                self.assertEqual(native_reader.call_count, 4)
+                result = json.loads(output.getvalue())["discovery"]
+                self.assertEqual(result["snapshot_generation"], generation + 1)
+                self.assertNotEqual(result["snapshot_digest"], case["failed_snapshot"])
+                self.assertFalse(list(owner.results.path.glob("recovery-*.json")))
 
     def test_owner_refresh_recovers_a_failed_required_collector(self):
         with patch("lib.engine.git_records", side_effect=SkillsRefusal("source_failed", 3)):

@@ -92,13 +92,22 @@ def _current(stamp, now):
     return 0 <= (now - timestamp(stamp)).total_seconds() <= 86400
 
 
-def _require_observation(entity, field, expected, pointer, now):
-    observations = [item for item in entity["observations"]
-                    if item["field"] == field and item["pointer"] == pointer
-                    and item["value"] == expected and item["state"] == "current"]
-    if len(observations) != 1 or not _current(observations[0]["observed_at"], now):
-        raise Refused("the Skills index lacks a fresh selected identity or location observation")
-    return DiscoveryObservation.from_snapshot(entity["id"], observations[0])
+def _require_current_observation(entity_id, item, now, snapshot_digest):
+    if item["state"] != "current" or not _current(item["observed_at"], now):
+        raise DiscoveryRepairRequired(
+            f"a required Skills {item['field']} observation is out of date; refresh the current projection",
+            snapshot_digest=snapshot_digest,
+        )
+    return DiscoveryObservation.from_snapshot(entity_id, item)
+
+
+def _require_observation(entity, field, expected, pointer, now, snapshot_digest):
+    matches = [item for item in entity["observations"]
+               if item["field"] == field and item["pointer"] == pointer and item["value"] == expected]
+    observations = [item for item in matches if item["state"] == "current"] or matches
+    if len(observations) != 1:
+        raise Refused("the Skills index lacks a unique selected identity or location observation")
+    return _require_current_observation(entity["id"], observations[0], now, snapshot_digest)
 
 
 def _shares_location(row, binding):
@@ -162,18 +171,21 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
     if context["status"] != "matches" or context["source_owner"] != repository:
         raise Refused("the Skills index has ambiguous ownership for the selected checkout")
 
+    snapshot_digest = receipt["snapshot_digest"]
     observed = (
-        _require_observation(entities[repository], "identity", "provider:" + provider, key, now),
-        _require_observation(entities[repository], "location", binding.checkout, key, now),
-        _require_observation(entities[clone], "location", binding.common_directory, key + "/git/common/config", now),
-        _require_observation(entities[worktree], "location", binding.checkout, key + "/git/worktree", now),
+        _require_observation(entities[repository], "identity", "provider:" + provider, key, now, snapshot_digest),
+        _require_observation(entities[repository], "location", binding.checkout, key, now, snapshot_digest),
+        _require_observation(entities[clone], "location", binding.common_directory,
+                             key + "/git/common/config", now, snapshot_digest),
+        _require_observation(entities[worktree], "location", binding.checkout,
+                             key + "/git/worktree", now, snapshot_digest),
     )
     remote = ("remote:github.com/" + hosted.full_name).casefold()
     origins = [item for item in entities[repository]["observations"]
                if item["field"] == "identity" and item["pointer"] == key + "/git/common/config"]
-    if (len(origins) != 1 or origins[0]["state"] != "current" or origins[0]["value"].casefold() != remote
-            or not _current(origins[0]["observed_at"], now)):
-        raise Refused("the Skills index lacks a fresh matching origin for the selected checkout")
+    if len(origins) != 1 or origins[0]["value"].casefold() != remote:
+        raise Refused("the Skills index lacks a matching origin for the selected checkout")
+    origin = _require_current_observation(repository, origins[0], now, snapshot_digest)
 
     warnings = []
     if snapshot["coverage"] == "partial" or omitted:
@@ -183,7 +195,7 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
     return DiscoveryEvidence(
         receipt["skills_revision"], receipt["snapshot_generation"], receipt["snapshot_digest"],
         snapshot["observed_at"], snapshot["coverage"], repository, clone, worktree,
-        (*observed, DiscoveryObservation.from_snapshot(repository, origins[0])), tuple(warnings),
+        (*observed, origin), tuple(warnings),
     )
 
 
