@@ -10,7 +10,7 @@ import sys
 from tempfile import TemporaryDirectory
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import DEFAULT, Mock, patch
 
 from github_checkout_provider import GitHubRepositoryObservation, TransientProviderRead
 from issue_checkout_evidence import issue_checkout_evidence_reissue, observe_checkout_authorities
@@ -563,6 +563,41 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
         host.assert_called_once()
         self.assertIn("lifecycle change", errors.getvalue())
 
+    def test_linked_desktop_connection_exhaustion_persists_and_preserves_accepted_result(self):
+        owner = self.command_owner()
+        args = ["adopt", self.linked.checkout, "--project-id", "fixture-project", "--thread-id", "fixture-thread"]
+        self.assertEqual(command.run(args, owner=owner, output=StringIO()), 0)
+        accepted, = owner.results.path.glob("adoption-*.json")
+        previous = accepted.read_bytes()
+        local_project = {"projectId": "fixture-project", "projectKind": "local", "hostId": "local",
+                         "isGitRepository": True, "label": "Sample Product", "path": self.primary.checkout}
+        catalog = Mock(return_value={"schemaVersion": 2, "projects": [local_project]})
+        linked = Mock(side_effect=ConnectionResetError("fixture disconnected"))
+        hosting = Mock(side_effect=owner.read_hosting)
+        owner = replace(owner, read_native=DesktopReader(catalog, linked), read_hosting=hosting)
+        output, errors = StringIO(), StringIO()
+        clock = [100.0]
+        with patch("repo_platform.recovery.time", side_effect=lambda: clock[0]), patch(
+            "repo_platform.recovery.sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)
+        ) as wait, patch("repo_platform.adoption.pin_checkout") as probe:
+            self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 1)
+            reopened = replace(owner, inventory=Inventory(owner.inventory.directory),
+                               results=AdoptionResults(owner.results.path))
+            self.assertEqual(command.run(args, owner=reopened, output=output, errors=errors), 1)
+            probe.assert_not_called()
+        self.assertEqual([call.args[0] for call in wait.call_args_list], [2, 5])
+        self.assertEqual(catalog.call_count, 3)
+        self.assertEqual(linked.call_count, 3)
+        hosting.assert_not_called()
+        self.assertIn("Codex diagnosis required after 3 attempt(s)", errors.getvalue())
+        self.assertIn("Codex Desktop project connection", errors.getvalue())
+        case, = owner.results.path.glob("recovery-*.json")
+        record = json.loads(case.read_bytes())
+        self.assertEqual((record["state"], record["kind"], record["elapsed_ms"]),
+                         ("diagnose", "native-transport", 7000))
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(accepted.read_bytes(), previous)
+
     def test_installed_owner_reader_uses_durable_profile_and_live_desktop_identity(self):
         root = self.root / "installed-owner"
         root.mkdir(mode=0o700)
@@ -583,25 +618,31 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
 
         local_project = {"projectId": "fixture-project", "projectKind": "local", "hostId": "local",
                          "isGitRepository": True, "label": "Sample Product", "path": self.primary.checkout}
-        list_projects = Mock(return_value={"schemaVersion": 2, "projects": [local_project]})
+        list_projects = Mock(return_value={"schemaVersion": 2, "projects": [local_project]},
+                             side_effect=[TimeoutError("fixture catalog timeout"), *([DEFAULT] * 4)])
         thread = {"id": "fixture-thread", "kind": "codex", "hostId": "local", "cwd": self.linked.checkout}
         linked = Mock(return_value=(thread | {"projectId": "fixture-project"}, thread))
         owner = self.command_owner()
         reader = DesktopReader(list_projects, linked)
         args = ["adopt", self.linked.checkout, "--project-id", "fixture-project", "--thread-id", "fixture-thread"]
         output, errors = StringIO(), StringIO()
-        self.assertEqual(host.run_installed(args, owner_state=root, read_native=reader, read_hosting=self.hosting,
-                                            read_delivery=owner.read_delivery, output=output, errors=errors),
-                         0, errors.getvalue())
+        clock = [100.0]
+        with patch("repo_platform.recovery.time", side_effect=lambda: clock[0]), patch(
+            "repo_platform.recovery.sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)
+        ) as wait:
+            self.assertEqual(host.run_installed(args, owner_state=root, read_native=reader, read_hosting=self.hosting,
+                                                read_delivery=owner.read_delivery, output=output, errors=errors),
+                             0, errors.getvalue())
+        wait.assert_called_once_with(2)
         result = json.loads(output.getvalue())
         self.assertEqual(result["checkout"], self.linked.checkout)
         self.assertEqual(result["discovery"]["snapshot_generation"], 2)
-        self.assertEqual(list_projects.call_count, 4)
+        self.assertEqual(list_projects.call_count, 5)
         self.assertEqual(linked.call_count, 4)
         accepted, = (root / "results").glob("adoption-*.json")
         previous = accepted.read_bytes()
 
-        list_projects.reset_mock()
+        list_projects.reset_mock(side_effect=True)
         self.write_private(stored, self.index_settings(optional_missing=True))
         with patch("repo_platform.adoption.pin_checkout") as probe:
             refusal, error = StringIO(), StringIO()

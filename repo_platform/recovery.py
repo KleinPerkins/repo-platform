@@ -28,6 +28,10 @@ class DiscoveryRepairRequired(Refused):
         self.snapshot_digest = snapshot_digest
 
 
+class TransientNativeRead(Refused):
+    """The native owner did not complete the project or linked chat read."""
+
+
 class DiagnosisRequired(Refused):
     """The case needs Codex diagnosis before another automatic attempt."""
 
@@ -57,8 +61,9 @@ class RecoveryCase:
                 while True:
                     try:
                         result = verify(self.deadline, self.begin_attempt)
-                    except TransientProviderRead as error:
-                        self.record_transport_failure(error)
+                    except (TransientProviderRead, TransientNativeRead) as error:
+                        kind = "native-transport" if isinstance(error, TransientNativeRead) else "hosting-transport"
+                        self.record_transport_failure(error, kind=kind)
                     except DiscoveryRepairRequired as error:
                         self.handle_discovery_failure(error, repair_skills)
                     except DiagnosisRequired:
@@ -118,10 +123,10 @@ class RecoveryCase:
         self.save()
         return attempt_deadline
 
-    def record_transport_failure(self, error):
+    def record_transport_failure(self, error, *, kind):
         if self.record is None:
             raise DiagnosisRequired(str(error))
-        self.record.update(kind="hosting-transport", reason=str(error), state="retry")
+        self.record.update(kind=kind, reason=str(error), state="retry")
         attempt = self.record["attempts"]
         if attempt >= MAX_ATTEMPTS:
             self.require_diagnosis()
@@ -154,7 +159,8 @@ class RecoveryCase:
     def require_diagnosis(self):
         self.record["state"] = "diagnose"
         self.save()
-        owner = "Skills refresh owner" if self.record["kind"] == "skills-refresh" else "Dev owner session"
+        owners = {"skills-refresh": "Skills refresh owner", "native-transport": "Codex Desktop project connection"}
+        owner = owners.get(self.record["kind"], "Dev owner session")
         raise DiagnosisRequired(
             f"Codex diagnosis required after {self.record['attempts']} attempt(s). "
             f"{self.record['reason']} Check current evidence through the {owner}."
@@ -171,7 +177,7 @@ class RecoveryCase:
                 or any(type(record.get(field)) is not int for field in ("started_ms", "ready_ms"))
                 or type(record.get("attempts")) is not int or not 0 <= record["attempts"] <= MAX_ATTEMPTS
                 or record.get("state") not in ("ready", "attempting", "retry", "diagnose")
-                or record.get("kind") not in ("interrupted", "hosting-transport", "skills-refresh")
+                or record.get("kind") not in ("interrupted", "hosting-transport", "native-transport", "skills-refresh")
                 or not isinstance(record.get("reason"), str)):
             raise Refused("the private adoption recovery record could not be validated")
         return record
