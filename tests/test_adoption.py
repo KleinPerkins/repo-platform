@@ -1,5 +1,6 @@
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from io import StringIO
 import json
 from pathlib import Path
@@ -578,7 +579,7 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
         descriptor = {"schema": host.OWNER_SESSION_SCHEMA, "operation": "proof",
                       "skills_revision": SKILLS_REVISION, "projection_digest": projection.manifest_digest,
                       "physical_bindings": [asdict(binding) for binding in self.physical.entries]}
-        self.write_private(root / "owner-session.json", encode(descriptor))
+        descriptor_path = self.write_private(root / "owner-session.json", encode(descriptor))
 
         local_project = {"projectId": "fixture-project", "projectKind": "local", "hostId": "local",
                          "isGitRepository": True, "label": "Sample Product", "path": self.primary.checkout}
@@ -609,6 +610,29 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
             probe.assert_not_called()
         self.assertEqual(refusal.getvalue(), "")
         self.assertIn("installed Dev owner state is unavailable", error.getvalue())
+        list_projects.assert_not_called()
+        self.assertEqual(accepted.read_bytes(), previous)
+
+        digest = sha256(settings).hexdigest()
+        versioned_settings = self.write_private(stored.parent / f"settings-{digest}.json", settings)
+        versioned_snapshot = f"snapshot-{projection.manifest_digest}.json"
+        for source in stored.parent.glob("snapshot.json*"):
+            shutil.copy2(source, stored.parent / source.name.replace("snapshot.json", versioned_snapshot, 1))
+        versioned = descriptor | {"schema": host.VERSIONED_OWNER_SESSION_SCHEMA, "settings_digest": digest}
+        self.write_private(descriptor_path, encode(versioned))
+        output, errors = StringIO(), StringIO()
+        self.assertEqual(host.run_installed(args, owner_state=root, read_native=reader, read_hosting=self.hosting,
+                                            read_delivery=owner.read_delivery, output=output, errors=errors),
+                         0, errors.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["discovery"]["snapshot_generation"], 2)
+        previous = accepted.read_bytes()
+        list_projects.reset_mock()
+        self.write_private(versioned_settings, self.index_settings(optional_missing=True))
+        output, errors = StringIO(), StringIO()
+        self.assertEqual(host.run_installed(args, owner_state=root, read_native=reader, read_hosting=self.hosting,
+                                            read_delivery=owner.read_delivery, output=output, errors=errors), 1)
+        self.assertIn("Skills settings differ", errors.getvalue())
+        self.assertEqual(output.getvalue(), "")
         list_projects.assert_not_called()
         self.assertEqual(accepted.read_bytes(), previous)
 
