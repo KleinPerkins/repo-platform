@@ -1226,6 +1226,57 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
                         self.select(self.primary.checkout, discovery=index)
                     probe.assert_not_called()
 
+    def test_index_requires_current_observations_for_a_shared_git_worktree(self):
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        owner = self.command_owner()
+        self.assertEqual(command.run(args, owner=owner, output=StringIO(), errors=StringIO()), 0)
+        saved, = owner.results.path.glob("adoption-*.json")
+        previous = saved.read_bytes()
+        linked_pointer = "inventory/linked/git/worktree"
+
+        for offset in (-86401, 300):
+            expired = (datetime.now(timezone.utc) + timedelta(seconds=offset)).isoformat()
+
+            def invalid_linked_observation(root, *args, **kwargs):
+                digest, entities, reused = git_records(root, *args, **kwargs)
+                if root["path"] == self.linked.checkout:
+                    worktree = next(row for row in entities if row["kind"] == "worktree")
+                    observation, = worktree["observations"]
+                    self.assertEqual(observation["pointer"], linked_pointer)
+                    observation["observed_at"] = expired
+                return digest, entities, reused
+
+            with self.subTest(offset=offset):
+                with patch("lib.engine.git_records", side_effect=invalid_linked_observation):
+                    index = self.index()
+                published = json.loads(index.cache.read_bytes())
+                self.assertEqual(published["coverage"], "complete")
+                self.assertTrue(any(item["pointer"] == linked_pointer and item["observed_at"] == expired
+                                    for row in published["entities"] for item in row["observations"]))
+                selected = replace(owner, discovery=index)
+                output, errors = StringIO(), StringIO()
+                with patch("repo_platform.adoption.pin_checkout", wraps=adoption.pin_checkout) as target:
+                    status = command.run(["preview", *args[1:]], owner=selected, output=output, errors=errors)
+                self.assertEqual(status, 1, "a fresh snapshot qualified an out-of-window related observation")
+                self.assertIn("required Skills location observation is out of date", errors.getvalue())
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(saved.read_bytes(), previous)
+                target.assert_not_called()
+
+                repair = SkillsRepair(self.index_settings(), self.root / "authority")
+                output, errors = StringIO(), StringIO()
+                with patch("repo_platform.skills_repair.refresh_admitted", wraps=refresh_admitted) as refresh:
+                    self.assertEqual(command.run(args, owner=replace(selected, skills_repair=repair),
+                                                 output=output, errors=errors), 0, errors.getvalue())
+                    refresh.assert_called_once()
+                result = json.loads(output.getvalue())["discovery"]
+                self.assertEqual(result["snapshot_generation"], published["generation"] + 1)
+                linked, = [item for item in result["related_observations"] if item["pointer"] == linked_pointer]
+                self.assertNotEqual(linked["observed_at"], expired)
+                self.assertEqual(linked["state"], "current")
+                previous = saved.read_bytes()
+                self.assertEqual(list(owner.results.path.glob("recovery-*.json")), [])
+
     def test_index_refuses_a_prior_inventory_generation_before_target_access(self):
         index = self.index()
         policy, generation, digest = index.projection.version

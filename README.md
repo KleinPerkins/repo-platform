@@ -29,9 +29,11 @@ and any saved adoption and recovery records unchanged.
 
 Use `adopt` with the same selection to recheck the live evidence and record a
 successful adoption. If required discovery evidence is stale, the configured
-Skills owner can refresh it during adoption. A failed adoption preserves the
-previous accepted record. Each repository's owners govern source changes,
-review, merge and release.
+Skills owner can refresh it during adoption. This applies to the selected
+checkout and any admitted worktree sharing its Git directories. The result
+records the observations used for those related worktrees. A failed adoption
+preserves the previous accepted record. Each repository's owners govern source
+changes, review, merge and release.
 
 If GitHub throttles a public repository read and reports a reset time,
 `adopt` saves that time privately. Subsequent previews and adoption attempts

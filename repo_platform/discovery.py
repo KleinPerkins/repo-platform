@@ -43,6 +43,7 @@ class DiscoveryEvidence:
     worktree_entity: str
     observations: tuple[DiscoveryObservation, ...]
     warnings: tuple[str, ...]
+    related_observations: tuple[DiscoveryObservation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,24 @@ def _shares_location(row, binding):
     )
 
 
+def _root_observations(entities, members, root, provider, remote, now, snapshot_digest):
+    repository, clone, worktree = members
+    key = "inventory/" + root["key"]
+    common = key + "/git/common/config"
+    observed = (
+        _require_observation(entities[repository], "identity", "provider:" + provider, key, now, snapshot_digest),
+        _require_observation(entities[repository], "location", root["path"], key, now, snapshot_digest),
+        _require_observation(entities[clone], "location", root["git"]["common_dir"], common, now, snapshot_digest),
+        _require_observation(entities[worktree], "location", root["path"],
+                             key + "/git/worktree", now, snapshot_digest),
+    )
+    origins = [item for item in entities[repository]["observations"]
+               if item["field"] == "identity" and item["pointer"] == common]
+    if len(origins) != 1 or origins[0]["value"].casefold() != remote:
+        raise DiscoveryConflict("the Skills index lacks a matching origin for an admitted checkout in the Git family")
+    return (*observed, _require_current_observation(repository, origins[0], now, snapshot_digest))
+
+
 def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted):
     now = datetime.now(timezone.utc)
     if not _current(snapshot["observed_at"], now):
@@ -159,16 +178,21 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
         raise Refused("the Skills projection omits a checkout related to the selected identity")
     required = {key, key + "/git"}
     family_parents = {repository: None, clone: repository, worktree: clone}
-    for path in related.intersection(by_path):
-        peer = by_path[path]
+    peers = []
+    for path in sorted(related - {binding.checkout}):
+        peer = by_path.get(path)
+        if peer is None or peer["git"] is None:
+            raise DiscoveryRepairRequired(
+                "the Skills projection lacks an admitted Git checkout related to the selection",
+                snapshot_digest=receipt["snapshot_digest"],
+            )
         peer_key = "inventory/" + peer["key"]
-        required.add(peer_key)
-        if peer["git"] is not None:
-            required.add(peer_key + "/git")
-            peer_clone = typed("clone", peer["git"]["common_dir"])
-            peer_worktree = typed("worktree", peer["git"]["git_dir"] + "\0" + path)
-            family_parents[peer_clone] = repository
-            family_parents[peer_worktree] = peer_clone
+        required.update((peer_key, peer_key + "/git"))
+        peer_clone = typed("clone", peer["git"]["common_dir"])
+        peer_worktree = typed("worktree", peer["git"]["git_dir"] + "\0" + path)
+        family_parents[peer_clone] = repository
+        family_parents[peer_worktree] = peer_clone
+        peers.append((peer, (repository, peer_clone, peer_worktree)))
     diagnostics = [receipt["input_diagnostics"][name] for name in required.intersection(receipt["input_diagnostics"])]
     if any(item["state"] in {"conflict", "omitted"} for item in diagnostics):
         raise DiscoveryConflict("the Skills refresh reports an unresolved input for the selected identity")
@@ -191,28 +215,20 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
         raise DiscoveryConflict("the Skills index does not establish a matching shared Git checkout parent")
     _check_conflicts(entities, selected_ids, related, inventory_rows, binding, provider, family_parents)
 
+    snapshot_digest = receipt["snapshot_digest"]
+    remote = ("remote:github.com/" + hosted.full_name).casefold()
+    observed = _root_observations(entities, selected_ids, selected_root, provider, remote, now, snapshot_digest)
+    related_observations = tuple(
+        observation for peer, members in peers
+        for observation in _root_observations(entities, members, peer, provider, remote, now, snapshot_digest)
+    )
+
     # Validate claims across the full receipt first. The context query checks
     # only the selected Git family, so unrelated timestamps cannot veto it.
     context_entities = [entity for eid, entity in entities.items() if eid in family_parents]
     context = query({**snapshot, "entities": context_entities}, "context", id=worktree)
     if context["status"] != "matches" or context["source_owner"] != repository:
         raise DiscoveryConflict("the Skills index has ambiguous ownership for the selected checkout")
-
-    snapshot_digest = receipt["snapshot_digest"]
-    observed = (
-        _require_observation(entities[repository], "identity", "provider:" + provider, key, now, snapshot_digest),
-        _require_observation(entities[repository], "location", binding.checkout, key, now, snapshot_digest),
-        _require_observation(entities[clone], "location", binding.common_directory,
-                             key + "/git/common/config", now, snapshot_digest),
-        _require_observation(entities[worktree], "location", binding.checkout,
-                             key + "/git/worktree", now, snapshot_digest),
-    )
-    remote = ("remote:github.com/" + hosted.full_name).casefold()
-    origins = [item for item in entities[repository]["observations"]
-               if item["field"] == "identity" and item["pointer"] == key + "/git/common/config"]
-    if len(origins) != 1 or origins[0]["value"].casefold() != remote:
-        raise DiscoveryConflict("the Skills index lacks a matching origin for the selected checkout")
-    origin = _require_current_observation(repository, origins[0], now, snapshot_digest)
 
     warnings = []
     if snapshot["coverage"] == "partial" or omitted:
@@ -225,7 +241,7 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
     return DiscoveryEvidence(
         receipt["skills_revision"], receipt["snapshot_generation"], receipt["snapshot_digest"],
         snapshot["observed_at"], snapshot["coverage"], repository, clone, worktree,
-        (*observed, origin), tuple(warnings),
+        observed, tuple(warnings), related_observations=related_observations,
     )
 
 
