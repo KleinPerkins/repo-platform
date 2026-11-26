@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 import os
+import re
 from time import monotonic, sleep, time
 
 from github_checkout_provider import TransientProviderRead
@@ -26,6 +27,15 @@ class DiscoveryRepairRequired(Refused):
     def __init__(self, message, *, snapshot_digest=None):
         super().__init__(message)
         self.snapshot_digest = snapshot_digest
+
+
+class DiscoveryConflict(Refused):
+    """Preserve a material claim that the Skills source owner must reconcile."""
+
+    def __init__(self, message, *, snapshot_digest=None, material_digest=None):
+        super().__init__(message)
+        self.snapshot_digest = snapshot_digest
+        self.material_digest = material_digest
 
 
 class TransientNativeRead(Refused):
@@ -81,6 +91,12 @@ class RecoveryCase:
                     except (TransientProviderRead, TransientNativeRead) as error:
                         kind = "native-transport" if isinstance(error, TransientNativeRead) else "hosting-transport"
                         self.record_transport_failure(error, kind=kind)
+                    except DiscoveryConflict as error:
+                        if self.record is None or error.material_digest is None or error.snapshot_digest is None:
+                            raise DiagnosisRequired(str(error)) from error
+                        self.record.update(kind="skills-conflict", reason=str(error),
+                                           failed_snapshot=error.snapshot_digest, material_digest=error.material_digest)
+                        self.require_diagnosis()
                     except DiscoveryRepairRequired as error:
                         self.handle_discovery_failure(error, repair_skills)
                     except DiagnosisRequired:
@@ -108,16 +124,21 @@ class RecoveryCase:
         evidence = {"dev_version": list(version), "projection_digest": self.projection.manifest_digest(),
                     "skills_revision": self.skills_revision,
                     "owner_operation": self.operation}
-        if (self.record is not None and self.record["evidence"] == evidence
-                and self.record["state"] == "diagnose" and self.record["kind"] == "skills-refresh"):
-            fresh_digest = self.refreshed_snapshot(version, self.deadline)
-            if fresh_digest is not None and fresh_digest != self.record.get("failed_snapshot"):
-                self.record = None
+        if self.record is not None and self.record["evidence"] == evidence and self.record["state"] == "diagnose":
+            kind = self.record["kind"]
+            if kind in {"skills-refresh", "skills-conflict"}:
+                material = kind == "skills-conflict"
+                previous = self.record.get("material_digest" if material else "failed_snapshot")
+                current = self.refreshed_snapshot(version, self.deadline, material=material)
+                if current is not None and current != previous:
+                    self.record = None
         if self.record is None or self.record["evidence"] != evidence:
             self.record = {"schema": SCHEMA, "evidence": evidence, "started_ms": self.started_ms,
                            "ready_ms": self.started_ms, "attempts": 0, "state": "ready",
                            "reason": "The previous verification was interrupted.", "kind": "interrupted"}
-        if self.record["state"] == "diagnose" or self.record["attempts"] >= MAX_ATTEMPTS:
+        if self.record["state"] == "diagnose":
+            self.require_diagnosis(persist=False)
+        if self.record["attempts"] >= MAX_ATTEMPTS:
             self.require_diagnosis()
 
         now = clock_ms()
@@ -173,10 +194,12 @@ class RecoveryCase:
         self.record.update(state="retry", ready_ms=clock_ms(), refreshed_snapshot=refreshed)
         self.save()
 
-    def require_diagnosis(self):
-        self.record["state"] = "diagnose"
-        self.save()
-        owners = {"skills-refresh": "Skills refresh owner", "native-transport": "Codex Desktop project connection"}
+    def require_diagnosis(self, *, persist=True):
+        if persist:
+            self.record["state"] = "diagnose"
+            self.save()
+        owners = {"skills-refresh": "Skills refresh owner", "skills-conflict": "Skills source owner",
+                  "native-transport": "Codex Desktop project connection"}
         owner = owners.get(self.record["kind"], "Dev owner session")
         raise DiagnosisRequired(
             f"Codex diagnosis required after {self.record['attempts']} attempt(s). "
@@ -194,8 +217,13 @@ class RecoveryCase:
                 or any(type(record.get(field)) is not int for field in ("started_ms", "ready_ms"))
                 or type(record.get("attempts")) is not int or not 0 <= record["attempts"] <= MAX_ATTEMPTS
                 or record.get("state") not in ("ready", "attempting", "retry", "diagnose")
-                or record.get("kind") not in ("interrupted", "hosting-transport", "native-transport", "skills-refresh")
+                or record.get("kind") not in ("interrupted", "hosting-transport", "native-transport",
+                                              "skills-refresh", "skills-conflict")
                 or not isinstance(record.get("reason"), str)):
+            raise Refused("the private adoption recovery record could not be validated")
+        if record["kind"] == "skills-conflict" and any(
+                not isinstance(record.get(key), str) or re.fullmatch(r"[a-f0-9]{64}", record[key]) is None
+                for key in ("material_digest", "failed_snapshot")):
             raise Refused("the private adoption recovery record could not be validated")
         return record
 

@@ -88,8 +88,8 @@ def _adopt(owner, args, verify):
         raise Refused("the Dev owner session has an invalid Skills repair binding")
     selected = selection_digest(args.project_id, args.checkout, args.thread_id)
 
-    def refreshed_snapshot(version, expires):
-        return owner.discovery.refreshed_reference(owner.inventory, version, owner.physical, expires)
+    def refreshed_snapshot(version, expires, *, material=False):
+        return owner.discovery.refreshed_reference(owner.inventory, version, owner.physical, expires, material=material)
 
     repair = None
     if owner.skills_repair is not None:

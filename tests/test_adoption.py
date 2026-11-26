@@ -783,6 +783,78 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
         self.assertEqual(observed["snapshot_generation"], 2)
         self.assertNotEqual(index.cache.read_bytes(), old)
 
+    def test_discovery_conflict_waits_for_reconciled_claims_across_commands(self):
+        owner = self.command_owner()
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        self.assertEqual(command.run(args, owner=owner, output=StringIO(), errors=StringIO()), 0)
+        accepted, = owner.results.path.glob("adoption-*.json")
+        last_result = accepted.read_bytes()
+
+        settings = json.loads(self.index_settings())
+        peer = next(row for row in settings["roots"] if row["path"] == self.peer.checkout)
+        peer["storage_fields"].append("aliases")
+        peer["sources"] = [{"adapter": "json", "path": "aliases.json", "fields": ["aliases"],
+                            "kind": "workspace", "revision": None}]
+        settings_bytes = encode(settings)
+        state = self.root / "authority"
+        projection = project_inventory(self.inventory, self.version, settings_bytes, deadline=time.monotonic() + 2)
+        config = store_projection(state, projection).config
+        cache = state / "conflicting-index.json"
+        guarded = guarded_admission(self.inventory, projection, SKILLS_REVISION, physical=self.physical)
+        peer_id = typed("repository", f"provider:github:{self.peer.repository_id}")
+        source = Path(self.peer.checkout) / "aliases.json"
+
+        def publish_claim(aliases, *, when):
+            source.write_bytes(encode({"schema": "ecosystem-index/metadata/v1", "entities": [
+                {"kind": "repository", "id": peer_id, "aliases": aliases},
+            ]}))
+            with patch("lib.engine.now", return_value=when.isoformat()):
+                return refresh_admitted(str(config), str(cache), guarded)["snapshot_digest"]
+
+        def run(session):
+            output, errors = StringIO(), StringIO()
+            result = command.run(args, owner=session, output=output, errors=errors)
+            return result, output.getvalue(), errors.getvalue()
+
+        def time_at(seconds):
+            return datetime.now(timezone.utc) - timedelta(seconds=seconds)
+
+        first_digest = publish_claim([self.primary.checkout], when=time_at(120))
+        hosted = Mock(wraps=owner.read_hosting)
+        native = Mock(wraps=owner.read_native)
+        owner = replace(owner, discovery=SkillsDiscovery(projection, cache, SKILLS_REVISION),
+                        skills_repair=SkillsRepair(settings_bytes, state), read_hosting=hosted, read_native=native)
+        with patch.object(SkillsRepair, "refresh", side_effect=AssertionError("blind owner refresh")), patch(
+            "repo_platform.adoption.pin_checkout", side_effect=AssertionError("selected checkout probe")
+        ):
+            code, output, errors = run(owner)
+            self.assertEqual((code, output), (1, ""))
+            self.assertIn("conflicting claim", errors)
+            self.assertIn("Skills source owner", errors)
+            case, = owner.results.path.glob("recovery-*.json")
+            blocked = case.read_bytes()
+            record = json.loads(blocked)
+            self.assertEqual((record["kind"], record["attempts"], record["failed_snapshot"]),
+                             ("skills-conflict", 1, first_digest))
+            self.assertEqual(accepted.read_bytes(), last_result)
+            self.assertEqual((hosted.call_count, native.call_count), (1, 2))
+
+            same_claim_digest = publish_claim([self.primary.checkout], when=time_at(60))
+            self.assertNotEqual(same_claim_digest, first_digest)
+            restarted = replace(owner, inventory=Inventory(self.inventory.directory),
+                                results=AdoptionResults(owner.results.path))
+            self.assertEqual(run(restarted), (code, output, errors))
+            self.assertEqual(case.read_bytes(), blocked)
+            self.assertEqual(accepted.read_bytes(), last_result)
+            self.assertEqual((hosted.call_count, native.call_count), (1, 2))
+
+        resolved = publish_claim([], when=time_at(0))
+        code, output, errors = run(restarted)
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(json.loads(output)["discovery"]["snapshot_digest"], resolved)
+        self.assertEqual((hosted.call_count, native.call_count), (2, 4))
+        self.assertFalse(case.exists())
+
     def test_refused_repair_preserves_prior_result_and_is_not_repeated_on_restart(self):
         owner = replace(self.command_owner(), skills_repair=SkillsRepair(self.index_settings(),
                                                                         self.root / "authority"))

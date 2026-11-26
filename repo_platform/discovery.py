@@ -2,16 +2,17 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 import os
 import time
 
 from lib.adapters import typed
-from lib.contracts import Refusal, timestamp
+from lib.contracts import Refusal, encode, timestamp
 from lib.deadline import deadline
 from lib.engine import query
 from lib.receipt_store import load_qualified_snapshot
 from personal_checkout_inventory import Refused
-from repo_platform.recovery import DiscoveryRepairRequired
+from repo_platform.recovery import DiscoveryConflict, DiscoveryRepairRequired
 from skills_inventory_projection import Projection, guarded_admission
 
 
@@ -52,8 +53,8 @@ class SkillsDiscovery:
     cache: os.PathLike | str
     skills_revision: str
 
-    def refreshed_reference(self, inventory, version, physical, expires):
-        """Read a fresh owner-bound receipt after an earlier Skills diagnosis."""
+    def refreshed_reference(self, inventory, version, physical, expires, *, material=False):
+        """Read current owner evidence without accessing a checkout or refreshing."""
         remaining = min(2, expires - time.monotonic())
         if remaining <= 0 or self.projection.version != version:
             return None
@@ -62,7 +63,7 @@ class SkillsDiscovery:
             with deadline(remaining):
                 snapshot, receipt = load_qualified_snapshot(os.fspath(self.cache), admission)
                 if _current(snapshot["observed_at"], datetime.now(timezone.utc)):
-                    return receipt["snapshot_digest"]
+                    return _material_reference(snapshot, receipt) if material else receipt["snapshot_digest"]
         except Refusal:
             pass
         return None
@@ -81,11 +82,29 @@ class SkillsDiscovery:
                 snapshot, receipt = load_qualified_snapshot(os.fspath(self.cache), admission)
                 roots = admission.validate()["roots"]
                 return _selected(snapshot, receipt, roots, self.projection.omitted, rows, binding, hosted)
+        except DiscoveryConflict as error:
+            raise DiscoveryConflict(str(error), snapshot_digest=receipt["snapshot_digest"],
+                                    material_digest=_material_reference(snapshot, receipt)) from error
         except Refusal as error:
             raise DiscoveryRepairRequired(
                 f"the Skills index receipt or read is unavailable ({error.code}); check the owner refresh",
                 snapshot_digest=receipt["snapshot_digest"] if receipt is not None else None,
             ) from error
+
+
+def _material_reference(snapshot, receipt):
+    """Bind ownership claims and collector outcomes, independent of refresh timestamps."""
+    claims = []
+    for entity in snapshot["entities"]:
+        observations = [tuple(item[key] for key in ("field", "value", "state", "source_kind", "pointer"))
+                        for item in entity["observations"]
+                        if item["field"] in {"identity", "location", "aliases", "edges"} and item["state"] != "missing"]
+        conflicts = sorted({"identity", "location", "parent"}.intersection(entity["conflicts"]))
+        if observations or conflicts:
+            claims.append((entity["id"], entity["parent"], conflicts, sorted(observations, key=encode)))
+    diagnostics = {key: entry for key, entry in receipt["input_diagnostics"].items()
+                   if key.count("/") == 1 or (key.endswith("/git") and key.count("/") == 2)}
+    return sha256(encode((sorted(claims, key=lambda claim: claim[0]), diagnostics))).hexdigest()
 
 
 def _current(stamp, now):
@@ -106,7 +125,7 @@ def _require_observation(entity, field, expected, pointer, now, snapshot_digest)
                if item["field"] == field and item["pointer"] == pointer and item["value"] == expected]
     observations = [item for item in matches if item["state"] == "current"] or matches
     if len(observations) != 1:
-        raise Refused("the Skills index lacks a unique selected identity or location observation")
+        raise DiscoveryConflict("the Skills index lacks a unique selected identity or location observation")
     return _require_current_observation(entity["id"], observations[0], now, snapshot_digest)
 
 
@@ -152,7 +171,7 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
             family_parents[peer_worktree] = peer_clone
     diagnostics = [receipt["input_diagnostics"][name] for name in required.intersection(receipt["input_diagnostics"])]
     if any(item["state"] in {"conflict", "omitted"} for item in diagnostics):
-        raise Refused("the Skills refresh reports an unresolved input for the selected identity")
+        raise DiscoveryConflict("the Skills refresh reports an unresolved input for the selected identity")
     if diagnostics:
         raise DiscoveryRepairRequired(
             "the Skills collector could not qualify a required checkout input",
@@ -169,7 +188,7 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
     selected_ids = (repository, clone, worktree)
     if any(eid not in entities or entities[eid]["parent"] != parent
            for eid, parent in family_parents.items()):
-        raise Refused("the Skills index does not establish a matching shared Git checkout parent")
+        raise DiscoveryConflict("the Skills index does not establish a matching shared Git checkout parent")
     _check_conflicts(entities, selected_ids, related, inventory_rows, binding, provider, family_parents)
 
     # Validate claims across the full receipt first. The context query checks
@@ -177,7 +196,7 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
     context_entities = [entity for eid, entity in entities.items() if eid in family_parents]
     context = query({**snapshot, "entities": context_entities}, "context", id=worktree)
     if context["status"] != "matches" or context["source_owner"] != repository:
-        raise Refused("the Skills index has ambiguous ownership for the selected checkout")
+        raise DiscoveryConflict("the Skills index has ambiguous ownership for the selected checkout")
 
     snapshot_digest = receipt["snapshot_digest"]
     observed = (
@@ -192,7 +211,7 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
     origins = [item for item in entities[repository]["observations"]
                if item["field"] == "identity" and item["pointer"] == key + "/git/common/config"]
     if len(origins) != 1 or origins[0]["value"].casefold() != remote:
-        raise Refused("the Skills index lacks a matching origin for the selected checkout")
+        raise DiscoveryConflict("the Skills index lacks a matching origin for the selected checkout")
     origin = _require_current_observation(repository, origins[0], now, snapshot_digest)
 
     warnings = []
@@ -228,21 +247,21 @@ def _check_conflicts(entities, selected_ids, related, inventory_rows, binding, p
             if entity_id in family_parents and item["field"] == "edges" and any(
                     edge["predicate"] == "belongs_to" and edge["classification"] in {"declared", "observed"}
                     and edge["target"] != family_parents[entity_id] for edge in item["value"]):
-                raise Refused("the Skills index contains a contradictory shared Git checkout parent claim")
+                raise DiscoveryConflict("the Skills index contains a contradictory shared Git checkout parent claim")
             if (item["field"] == "identity" and item["value"] == "provider:" + provider
                     and entity_id != repository):
-                raise Refused("the Skills index contains a conflicting claim on the immutable repository ID")
+                raise DiscoveryConflict("the Skills index contains a conflicting claim on the immutable repository ID")
             if (entity_id in selected_locations and item["field"] == "location"
                     and item["value"] != selected_locations[entity_id]):
-                raise Refused("the Skills index contains conflicting locations for the selected Git entity")
+                raise DiscoveryConflict("the Skills index contains conflicting locations for the selected Git entity")
             locations = ([item["value"]] if item["field"] == "location"
                          else item["value"] if item["field"] == "aliases" else [])
             for path in locations:
                 if path in claimants and kind in claimants[path]:
                     if entity_id != claimants[path][kind]:
-                        raise Refused("the Skills index contains a conflicting claim on an admitted checkout")
+                        raise DiscoveryConflict("the Skills index contains a conflicting claim on an admitted checkout")
                     matched = True
                 if path in git_roles and kind in {"clone", "worktree"} and entity_id not in git_roles[path]:
-                    raise Refused("the Skills index contains a conflicting claim on an admitted Git location")
+                    raise DiscoveryConflict("the Skills index contains a conflicting claim on an admitted Git location")
         if matched and {"identity", "parent"}.intersection(entity["conflicts"]):
-            raise Refused("the Skills index contains an unresolved identity or parent conflict")
+            raise DiscoveryConflict("the Skills index contains an unresolved identity or parent conflict")
