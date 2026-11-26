@@ -23,6 +23,7 @@ from repo_platform import adoption, command, host
 from repo_platform.adoption_results import AdoptionResults
 from repo_platform.desktop import DesktopReader
 from repo_platform.discovery import SkillsDiscovery
+from repo_platform.recovery import TransientNativeRead
 from repo_platform.skills_repair import SkillsRepair
 from skills_inventory_projection import guarded_admission, project_inventory, store_projection
 
@@ -370,6 +371,40 @@ class AdoptionTests(unittest.TestCase):
         return command.OwnerSession(self.inventory, "proof", self.physical, acquire_native,
                                     self.hosting, classify, self.index(), AdoptionResults(storage))
 
+    def test_read_only_preview_uses_live_ownership_without_recording_an_adoption(self):
+        checkout = self.linked.checkout
+        args = [checkout, "--project-id", "fixture-project", "--thread-id", "fixture-thread",
+                "--repository-id", "73", "--expected-title", "A different display title"]
+        owner = self.command_owner()
+        self.assertEqual(command.run(["adopt", *args], owner=owner, output=StringIO(), errors=StringIO()), 0)
+        prior_results = {file.name: file.read_bytes() for file in owner.results.path.iterdir()}
+        prior_snapshot = owner.discovery.cache.read_bytes()
+        prior_inventory = self.inventory.snapshot()
+        gitfile = Path(checkout) / ".git"
+        prior_gitfile = gitfile.read_bytes()
+        native = Mock(wraps=owner.read_native)
+        hosting = Mock(wraps=owner.read_hosting)
+        delivery = Mock(wraps=owner.read_delivery)
+        owner = replace(owner, read_native=native, read_hosting=hosting, read_delivery=delivery)
+        output, errors = StringIO(), StringIO()
+        with patch("repo_platform.command.RecoveryCase", side_effect=AssertionError("write recovery")), patch.object(
+            AdoptionResults, "publish", side_effect=AssertionError("write adoption")
+        ):
+            self.assertEqual(command.run(["preview", *args], owner=owner, output=output, errors=errors),
+                             0, errors.getvalue())
+        observed = json.loads(output.getvalue())
+        self.assertEqual(observed["repository_id"], 73)
+        self.assertEqual(observed["checkout"], checkout)
+        self.assertEqual(observed["local_head"], self.local_head)
+        self.assertEqual(observed["hosted_default_head"], HOSTED_HEAD)
+        self.assertEqual(observed["owner_handoff"], "private-repository-owner")
+        self.assertIn("Codex project display title differs from the selected title.", observed["warnings"])
+        self.assertEqual((native.call_count, hosting.call_count, delivery.call_count), (2, 1, 2))
+        self.assertEqual(self.inventory.snapshot(), prior_inventory)
+        self.assertEqual(owner.discovery.cache.read_bytes(), prior_snapshot)
+        self.assertEqual({file.name: file.read_bytes() for file in owner.results.path.iterdir()}, prior_results)
+        self.assertEqual(gitfile.read_bytes(), prior_gitfile)
+
     def test_explicit_command_prints_private_owner_handoff_and_preserves_prior_result(self):
         owner = self.command_owner()
         args = ["adopt", self.linked.checkout, "--project-id", "fixture-project",
@@ -569,6 +604,36 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
         self.assertEqual(command.run(args, owner=advanced, output=StringIO(), errors=advanced_errors),
                          0, advanced_errors.getvalue())
         self.assertFalse(case.exists())
+
+    def test_read_only_preview_retries_transient_reads_without_a_recovery_record(self):
+        owner = self.command_owner()
+        observation = self.native("fixture-project", self.primary.checkout, deadline=time.monotonic() + 2)
+        native = Mock(side_effect=[TransientNativeRead("native fixture unavailable"), observation, observation])
+        args = ["preview", self.primary.checkout, "--project-id", "fixture-project"]
+        output, errors = StringIO(), StringIO()
+        with patch("repo_platform.recovery.sleep") as wait:
+            self.assertEqual(command.run(args, owner=replace(owner, read_native=native),
+                                         output=output, errors=errors), 0, errors.getvalue())
+        wait.assert_called_once_with(2)
+        self.assertEqual(native.call_count, 3)
+        self.assertTrue(output.getvalue())
+        self.assertEqual(list(owner.results.path.iterdir()), [])
+
+    def test_read_only_preview_leaves_stale_discovery_for_the_adoption_owner(self):
+        index = self.index(stale_offset=86401)
+        owner = replace(self.command_owner(), discovery=index,
+                        skills_repair=SkillsRepair(self.index_settings(), self.root / "authority"))
+        args = ["preview", self.primary.checkout, "--project-id", "fixture-project"]
+        before = index.cache.read_bytes()
+        output, errors = StringIO(), StringIO()
+        with patch.object(SkillsRepair, "refresh") as refresh, patch("repo_platform.adoption.pin_checkout") as probe:
+            self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 1)
+            refresh.assert_not_called()
+            probe.assert_not_called()
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("Run adopt to request a refresh through the Skills owner", errors.getvalue())
+        self.assertEqual(list(owner.results.path.iterdir()), [])
+        self.assertEqual(index.cache.read_bytes(), before)
 
     def test_stale_skills_snapshot_goes_straight_to_owner_diagnosis(self):
         owner = replace(self.command_owner(), discovery=self.index(stale_offset=86401))

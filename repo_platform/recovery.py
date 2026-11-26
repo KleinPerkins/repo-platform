@@ -40,6 +40,23 @@ def clock_ms():
     return int(time() * MILLISECONDS)
 
 
+def read_only_preview(verify):
+    """Retry transient owner reads within the normal budget, without a journal."""
+    expires = monotonic() + BUDGET_SECONDS
+    for delay in (0, *DELAYS):
+        if delay:
+            if expires - monotonic() <= delay:
+                break
+            sleep(delay)
+        try:
+            return verify(expires)
+        except (TransientProviderRead, TransientNativeRead) as error:
+            last_error = error
+    raise DiagnosisRequired(
+        f"Codex diagnosis required. {last_error} Check the native project and hosting connections."
+    ) from last_error
+
+
 class RecoveryCase:
     def __init__(self, directory, selection, projection, skills_revision, operation, refreshed_snapshot):
         self.directory = os.fspath(directory)
