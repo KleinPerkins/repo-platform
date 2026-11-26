@@ -14,6 +14,7 @@ from unittest.mock import DEFAULT, Mock, patch
 
 from github_checkout_provider import GitHubRepositoryObservation, TransientProviderRead
 from issue_checkout_evidence import issue_checkout_evidence_reissue, observe_checkout_authorities
+from lib.adapters import make_observation, typed
 from lib.contracts import Refusal as SkillsRefusal, encode
 from lib.engine import git_records, refresh_admitted
 from native_checkout_project import NativeProjectBinding
@@ -993,6 +994,74 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
                 with self.assertRaisesRegex(Refused, reason):
                     self.select(self.primary.checkout, discovery=index)
                 probe.assert_not_called()
+
+    def test_index_accepts_selected_checkout_with_a_future_dated_disjoint_peer(self):
+        future = (datetime.now(timezone.utc) + timedelta(minutes=4)).isoformat()
+
+        def future_observation(root, *args, **kwargs):
+            digest, entities, reused = git_records(root, *args, **kwargs)
+            if root["path"] == self.peer.checkout:
+                peer = next(row for row in entities if row["kind"] == "worktree")
+                peer["observations"][0]["observed_at"] = future
+            return digest, entities, reused
+
+        owner = self.command_owner()
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        with patch("lib.engine.git_records", side_effect=future_observation):
+            index = self.index()
+        original = index.cache.read_bytes()
+        snapshot = json.loads(original)
+        self.assertEqual(snapshot["coverage"], "complete")
+        self.assertTrue(any(item["observed_at"] == future for entry in snapshot["entities"]
+                            for item in entry["observations"]))
+        repair = SkillsRepair(self.index_settings(), self.root / "authority")
+        owner = replace(owner, discovery=index, skills_repair=repair)
+        output, errors = StringIO(), StringIO()
+        with patch.object(SkillsRepair, "refresh", side_effect=AssertionError("unrelated refresh")):
+            self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 0, errors.getvalue())
+        evidence = json.loads(output.getvalue())["discovery"]
+        self.assertEqual(evidence["snapshot_generation"], snapshot["generation"])
+        self.assertTrue(any("future-dated" in warning for warning in evidence["warnings"]))
+        self.assertEqual(index.cache.read_bytes(), original)
+
+        with patch("lib.engine.git_records", side_effect=future_observation):
+            conflicting = self.index(conflicting_alias=True)
+        saved, = owner.results.path.glob("adoption-*.json")
+        last_result = saved.read_bytes()
+        output, errors = StringIO(), StringIO()
+        with patch("repo_platform.adoption.pin_checkout") as probe:
+            self.assertEqual(command.run(args, owner=replace(owner, discovery=conflicting),
+                                         output=output, errors=errors), 1)
+            probe.assert_not_called()
+        self.assertIn("conflicting claim", errors.getvalue())
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(saved.read_bytes(), last_result)
+
+    def test_index_refuses_a_contradictory_parent_on_a_shared_git_worktree(self):
+        other_clone = typed("clone", self.peer.common_directory)
+        for field in ("parent", "edges"):
+            def contradictory_parent(root, *args, **kwargs):
+                digest, entities, reused = git_records(root, *args, **kwargs)
+                if root["path"] == self.linked.checkout:
+                    alias = next(row for row in entities if row["kind"] == "worktree")
+                    if field == "parent":
+                        alias["parent"] = other_clone
+                    else:
+                        current = alias["observations"][0]
+                        edge = {"predicate": "belongs_to", "target": other_clone,
+                                "classification": "observed", "pointer": current["pointer"]}
+                        alias["observations"].append(make_observation(
+                            "edges", [edge], "observed", "git", current["pointer"], None,
+                            current["digest"], current["observed_at"],
+                        ))
+                return digest, entities, reused
+
+            with self.subTest(field=field), patch("lib.engine.git_records", side_effect=contradictory_parent):
+                index = self.index(optional_missing=field == "edges")
+                with patch("repo_platform.adoption.pin_checkout", wraps=adoption.pin_checkout) as probe:
+                    with self.assertRaisesRegex(Refused, "shared Git.*parent"):
+                        self.select(self.primary.checkout, discovery=index)
+                    probe.assert_not_called()
 
     def test_index_refuses_a_prior_inventory_generation_before_target_access(self):
         index = self.index()

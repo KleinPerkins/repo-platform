@@ -139,12 +139,17 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
     if any(path in related for path, _ in omitted):
         raise Refused("the Skills projection omits a checkout related to the selected identity")
     required = {key, key + "/git"}
+    family_parents = {repository: None, clone: repository, worktree: clone}
     for path in related.intersection(by_path):
         peer = by_path[path]
         peer_key = "inventory/" + peer["key"]
         required.add(peer_key)
         if peer["git"] is not None:
             required.add(peer_key + "/git")
+            peer_clone = typed("clone", peer["git"]["common_dir"])
+            peer_worktree = typed("worktree", peer["git"]["git_dir"] + "\0" + path)
+            family_parents[peer_clone] = repository
+            family_parents[peer_worktree] = peer_clone
     diagnostics = [receipt["input_diagnostics"][name] for name in required.intersection(receipt["input_diagnostics"])]
     if any(item["state"] in {"conflict", "omitted"} for item in diagnostics):
         raise Refused("the Skills refresh reports an unresolved input for the selected identity")
@@ -162,12 +167,15 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
 
     entities = {entity["id"]: entity for entity in snapshot["entities"]}
     selected_ids = (repository, clone, worktree)
-    parents = (None, repository, clone)
     if any(eid not in entities or entities[eid]["parent"] != parent
-           for eid, parent in zip(selected_ids, parents, strict=True)):
-        raise Refused("the Skills index does not establish the selected checkout's parent chain")
-    _check_conflicts(entities, selected_ids, related, inventory_rows, binding, provider)
-    context = query(snapshot, "context", id=worktree)
+           for eid, parent in family_parents.items()):
+        raise Refused("the Skills index does not establish a matching shared Git checkout parent")
+    _check_conflicts(entities, selected_ids, related, inventory_rows, binding, provider, family_parents)
+
+    # Validate claims across the full receipt first. The context query checks
+    # only the selected Git family, so unrelated timestamps cannot veto it.
+    context_entities = [entity for eid, entity in entities.items() if eid in family_parents]
+    context = query({**snapshot, "entities": context_entities}, "context", id=worktree)
     if context["status"] != "matches" or context["source_owner"] != repository:
         raise Refused("the Skills index has ambiguous ownership for the selected checkout")
 
@@ -190,6 +198,9 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
     warnings = []
     if snapshot["coverage"] == "partial" or omitted:
         warnings.append("Skills discovery has incomplete coverage outside the required checkout evidence.")
+    if any(timestamp(item["observed_at"]) > now for eid, entity in entities.items() if eid not in family_parents
+           for item in entity["observations"]):
+        warnings.append("Skills discovery includes future-dated evidence outside the selected checkout's Git family.")
     if "title" in entities[repository]["conflicts"]:
         warnings.append("Skills discovery reports differing display titles for this repository.")
     return DiscoveryEvidence(
@@ -199,7 +210,7 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
     )
 
 
-def _check_conflicts(entities, selected_ids, related, inventory_rows, binding, provider):
+def _check_conflicts(entities, selected_ids, related, inventory_rows, binding, provider, family_parents):
     repository, clone, worktree = selected_ids
     claimants = {path: {"repository": repository, "clone": typed("clone", row["common_directory"]),
                         "worktree": typed("worktree", row["git_directory"] + "\0" + path)}
@@ -214,6 +225,10 @@ def _check_conflicts(entities, selected_ids, related, inventory_rows, binding, p
         for item in entity["observations"]:
             if item["state"] == "missing":
                 continue
+            if entity_id in family_parents and item["field"] == "edges" and any(
+                    edge["predicate"] == "belongs_to" and edge["classification"] in {"declared", "observed"}
+                    and edge["target"] != family_parents[entity_id] for edge in item["value"]):
+                raise Refused("the Skills index contains a contradictory shared Git checkout parent claim")
             if (item["field"] == "identity" and item["value"] == "provider:" + provider
                     and entity_id != repository):
                 raise Refused("the Skills index contains a conflicting claim on the immutable repository ID")
