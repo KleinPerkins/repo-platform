@@ -11,6 +11,7 @@ from typing import Callable
 from personal_checkout_inventory import Inventory, Refused
 from physical_checkout_binding import OwnerPhysicalBindings
 from repo_platform.adoption import preview
+from repo_platform.discovery import SkillsDiscovery
 
 
 ADOPTION_BUDGET_SECONDS = 90
@@ -32,6 +33,7 @@ class OwnerSession:
     read_native: Callable
     read_hosting: Callable
     read_delivery: Callable
+    discovery: SkillsDiscovery
 
 
 def run(argv, *, owner: OwnerSession, output=None, errors=None):
@@ -49,12 +51,15 @@ def run(argv, *, owner: OwnerSession, output=None, errors=None):
     try:
         if not callable(owner.read_delivery):
             raise Refused("the Dev owner session has no delivery policy reader")
+        if not isinstance(owner.discovery, SkillsDiscovery):
+            raise Refused("the Dev owner session has no qualified Skills index reader")
         result = preview(
             owner.inventory, args.checkout, args.project_id, owner.operation,
             physical=owner.physical, read_native=partial(owner.read_native, thread_id=args.thread_id),
             read_hosting=owner.read_hosting, read_delivery=owner.read_delivery,
             deadline=time.monotonic() + ADOPTION_BUDGET_SECONDS, thread_id=args.thread_id,
             expected_title=args.expected_title, expected_repository_id=args.repository_id,
+            discovery=owner.discovery,
         )
     except Refused as error:
         print(f"Checkout adoption refused. {error}", file=errors if errors is not None else sys.stderr)

@@ -13,6 +13,7 @@ from native_checkout_project import NativeProjectBinding, selection_digest
 from personal_checkout_inventory import Binding, Refused, lexical
 from personal_scope import child_directory, read_regular
 from physical_checkout_binding import OwnerPhysicalBindings, ROLES, pin_checkout
+from repo_platform.discovery import DiscoveryEvidence
 from skills_inventory_projection import linked_relationship
 
 
@@ -49,6 +50,7 @@ class AdoptionPreview:
     dev_version: tuple[str, int, str]
     owner_evidence_digest: str
     delivery: DeliveryClassification | None
+    discovery: DiscoveryEvidence | None
     warnings: tuple[str, ...]
 
 
@@ -107,12 +109,13 @@ def _local_head(binding, reader):
 
 def preview(inventory, checkout, project_id, owner_operation, *, physical,
             read_native, read_hosting, deadline, thread_id=None, expected_title=None,
-            expected_repository_id=None, read_delivery=None):
+            expected_repository_id=None, read_delivery=None, discovery=None):
     """Return a read-only preview; native and hosting readers belong to the caller's owner connection."""
     checkout = lexical(checkout)
     selected = selection_digest(project_id, checkout, thread_id)
     raw, version = inventory.snapshot()
-    row = json.loads(raw)["bindings"].get(checkout)
+    inventory_rows = json.loads(raw)["bindings"]
+    row = inventory_rows.get(checkout)
     # Route even an absent row through Dev so it can distinguish a denied path
     # from an unregistered path before any native, provider, or target read.
     locations = (("checkout", checkout),)
@@ -193,6 +196,13 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
                  *(owner[name] for name in SOURCE_READ_TIMES))
         if not all(_fresh(observed, now) for observed in times):
             raise Refused("fresh owner, native, and hosting observations are required")
+
+        indexed = None
+        if discovery is not None:
+            indexed = discovery.qualify(
+                inventory=inventory, version=version, rows=inventory_rows, binding=admitted,
+                physical=physical, hosted=hosted, expires=expires,
+            )
         with pin_checkout(admitted, proof, locations + admitted.linked_metadata(), expires) as reader:
             linked_relationship(admitted, reader)
             verify_git_config(admitted, reader, config)
@@ -201,7 +211,7 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
                 raise Refused("the local HEAD changed during the preview")
             verify_git_config(admitted, reader, config)
             linked_relationship(admitted, reader)
-        warnings = []
+        warnings = list(indexed.warnings) if indexed is not None else []
         if native.title != initial_native.title:
             warnings.append("Codex project display title changed during the preview.")
         if expected_title is not None and native.title is not None and native.title != expected_title:
@@ -210,7 +220,8 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
             project_id, checkout, binding.git_directory, binding.common_directory,
             hosted.repository_id, hosted.full_name, native.title, head, hosted.default_branch,
             hosted.default_head, hosted.private, native.selection_digest, native.observed_at,
-            hosted.identity_observed_at, hosted.ref_observed_at, version, scope.digest, delivery, tuple(warnings),
+            hosted.identity_observed_at, hosted.ref_observed_at, version, scope.digest, delivery, indexed,
+            tuple(warnings),
         )
 
     return inventory.read_bound(

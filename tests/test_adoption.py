@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 import json
 from pathlib import Path
@@ -10,13 +11,18 @@ from unittest.mock import Mock, patch
 
 from github_checkout_provider import GitHubRepositoryObservation
 from issue_checkout_evidence import issue_checkout_evidence_reissue, observe_checkout_authorities
+from lib.contracts import encode
+from lib.engine import refresh_admitted
 from native_checkout_project import NativeProjectBinding
 from personal_checkout_inventory import Binding, Inventory, Refused
 from physical_checkout_binding import OwnerPhysicalBinding, OwnerPhysicalBindings, ROLES
 from repo_platform import adoption, command
+from repo_platform.discovery import SkillsDiscovery
+from skills_inventory_projection import guarded_admission, project_inventory, store_projection
 
 
 HOSTED_HEAD = "ace0" * 10
+SKILLS_REVISION = "a6f797c28fa1f6ef602b78e9c5d8ac871f781755"
 
 
 def git(root, *args):
@@ -29,7 +35,7 @@ def git(root, *args):
 
 class AdoptionTests(unittest.TestCase):
     def setUp(self):
-        scratch = TemporaryDirectory(prefix="repo-platform-adoption-")
+        scratch = TemporaryDirectory(prefix="repo-platform-adoption-", dir=Path("/tmp").resolve())
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name).resolve()
         primary = self.root / "sample.product"
@@ -46,13 +52,19 @@ class AdoptionTests(unittest.TestCase):
                                "primary", ("adopt", "enumerate"))
         self.linked = Binding(str(linked), str(common / "worktrees" / linked.name), str(common),
                               "github", 73, "clone", "linked", ("adopt", "enumerate"))
+        peer = self.root / "other" / primary.name
+        peer.mkdir(parents=True)
+        git(peer, "init", "-b", "fixture", "--template=")
+        git(peer, "remote", "add", "origin", "https://github.com/other/sample.product.git")
+        self.peer = Binding(str(peer), str(peer / ".git"), str(peer / ".git"), "github", 74,
+                            "peer-clone", "peer", ("adopt", "enumerate"))
         self.denied = str(self.root / "denied")
         (self.root / "authority").mkdir(mode=0o700)
         self.inventory = Inventory(self.root / "authority")
         version = self.inventory.initialize("fixture-host", "fixture-policy", [self.denied],
-                                            [self.primary, self.linked])
+                                            [self.primary, self.linked, self.peer])
         proofs = []
-        for binding in (self.primary, self.linked):
+        for binding in (self.primary, self.linked, self.peer):
             locations = []
             for role in ROLES:
                 path = getattr(binding, role)
@@ -80,12 +92,44 @@ class AdoptionTests(unittest.TestCase):
         return GitHubRepositoryObservation(repository_id, "example/sample.product", "main",
                                            HOSTED_HEAD, True, False, now, now)
 
-    def select(self, path, *, read_native=None, read_hosting=None, thread=None):
+    def select(self, path, *, read_native=None, read_hosting=None, thread=None, discovery=None):
         return adoption.preview(
             self.inventory, path, "fixture-project", "proof", physical=self.physical,
             read_native=read_native or self.native, read_hosting=read_hosting or self.hosting,
             thread_id=thread, deadline=time.monotonic() + 3, expected_title="Sample Product",
+            discovery=discovery,
         )
+
+    def index(self, *, stale_offset=0, bad_origin=False, optional_missing=False,
+              conflicting_alias=False, publish=True):
+        storage = self.root / "authority"
+        config = {"schema": "ecosystem-index/config/v1", "exclude_paths": [], "exclude_identities": [],
+                  "bounds": {"roots": 3, "entities": 32, "input_bytes": 65536,
+                             "snapshot_bytes": 1048576, "refresh_seconds": 10}, "roots": []}
+        for binding in (self.primary, self.linked, self.peer):
+            origin = "different.product" if bad_origin and binding == self.linked else "sample.product"
+            namespace = "other" if binding == self.peer else "example"
+            root = {"key": binding.worktree_id, "path": binding.checkout, "scope": "permitted", "inventory": "native",
+                    "title": "Sample Product", "aliases": [], "storage_fields": ["title"], "sources": [],
+                    "identity": {"provider": None, "remote": f"https://github.com/{namespace}/{origin}"},
+                    "git": {"git_dir": binding.git_directory, "common_dir": binding.common_directory}}
+            if optional_missing and binding == self.peer:
+                root["storage_fields"].append("description")
+                root["sources"] = [{"adapter": "json", "path": "optional.json", "fields": ["description"],
+                                    "kind": "workspace", "revision": None}]
+            if conflicting_alias and binding == self.peer:
+                root["storage_fields"].append("aliases")
+                root["aliases"] = [self.primary.checkout]
+            config["roots"].append(root)
+        projection = project_inventory(self.inventory, self.version, encode(config), deadline=time.monotonic() + 2)
+        cache = storage / ("cache-" + projection.config_digest() + f"-{stale_offset}.json")
+        if publish:
+            stored = store_projection(storage, projection)
+            admission = guarded_admission(self.inventory, projection, SKILLS_REVISION, physical=self.physical)
+            when = (datetime.now(timezone.utc) - timedelta(seconds=stale_offset)).isoformat()
+            with patch("lib.engine.now", return_value=when):
+                refresh_admitted(str(stored.config), str(cache), admission)
+        return SkillsDiscovery(projection, cache, SKILLS_REVISION)
 
     def test_primary_and_linked_keep_the_local_and_hosted_heads_separate(self):
         # Pack the primary branch to exercise fallback; a detached linked HEAD
@@ -195,7 +239,7 @@ class AdoptionTests(unittest.TestCase):
             )
 
         owner = command.OwnerSession(self.inventory, "proof", self.physical,
-                                     acquire_native, self.hosting, classify)
+                                     acquire_native, self.hosting, classify, self.index())
         args = ["adopt", self.linked.checkout, "--project-id", "fixture-project",
                 "--thread-id", "fixture-thread", "--repository-id"]
         output, errors = StringIO(), StringIO()
@@ -205,6 +249,9 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(result["owner_handoff"], "private-repository-owner")
         self.assertEqual(result["delivery"]["disposition"], "private-no-ci")
         self.assertEqual(result["checkout"], self.linked.checkout)
+        self.assertEqual(result["discovery"]["skills_revision"], SKILLS_REVISION)
+        self.assertEqual(len(result["discovery"]["observations"]), 5)
+        self.assertTrue(all(row["state"] == "current" for row in result["discovery"]["observations"]))
         self.assertEqual(errors.getvalue(), "")
         with patch("repo_platform.adoption.pin_checkout") as probe:
             self.assertEqual(command.run([*args, "74"], owner=owner, output=output, errors=errors), 1)
@@ -219,3 +266,37 @@ class AdoptionTests(unittest.TestCase):
             self.assertEqual(command.run([*args, "73"], owner=forbidden, output=output, errors=errors), 1)
             probe.assert_not_called()
         self.assertEqual(output.getvalue(), prior)
+
+    def test_index_joins_one_repository_and_clone_with_two_worktrees(self):
+        index = self.index(optional_missing=True)
+        primary = self.select(self.primary.checkout, discovery=index).discovery
+        linked = self.select(self.linked.checkout, thread="fixture-thread", discovery=index).discovery
+        self.assertEqual(primary.repository_entity, linked.repository_entity)
+        self.assertEqual(primary.clone_entity, linked.clone_entity)
+        self.assertNotEqual(primary.worktree_entity, linked.worktree_entity)
+        self.assertEqual(primary.snapshot_digest, linked.snapshot_digest)
+        self.assertEqual(primary.coverage, "partial")
+        self.assertEqual(len(primary.warnings), 1)
+
+    def test_index_refuses_missing_stale_future_and_related_conflict_before_target_access(self):
+        for options, reason in (
+            ({"publish": False}, "index receipt"),
+            ({"stale_offset": 86401}, "stale or future"),
+            ({"stale_offset": -300}, "stale or future"),
+            ({"bad_origin": True}, "unresolved input"),
+            ({"conflicting_alias": True}, "conflicting claim"),
+        ):
+            index = self.index(**options)
+            with self.subTest(options=options), patch("repo_platform.adoption.pin_checkout") as probe:
+                with self.assertRaisesRegex(Refused, reason):
+                    self.select(self.primary.checkout, discovery=index)
+                probe.assert_not_called()
+
+    def test_index_refuses_a_prior_inventory_generation_before_target_access(self):
+        index = self.index()
+        policy, generation, digest = index.projection.version
+        prior = replace(index.projection, version=(policy, generation - 1, digest))
+        with patch("repo_platform.adoption.pin_checkout") as probe:
+            with self.assertRaisesRegex(Refused, "older Dev binding"):
+                self.select(self.primary.checkout, discovery=replace(index, projection=prior))
+            probe.assert_not_called()
