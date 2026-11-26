@@ -1,8 +1,9 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -17,8 +18,9 @@ from lib.engine import refresh_admitted
 from native_checkout_project import NativeProjectBinding
 from personal_checkout_inventory import Binding, Inventory, Refused
 from physical_checkout_binding import OwnerPhysicalBinding, OwnerPhysicalBindings, ROLES
-from repo_platform import adoption, command
+from repo_platform import adoption, command, host
 from repo_platform.adoption_results import AdoptionResults
+from repo_platform.desktop import DesktopReader
 from repo_platform.discovery import SkillsDiscovery
 from repo_platform.skills_repair import SkillsRepair
 from skills_inventory_projection import guarded_admission, project_inventory, store_projection
@@ -559,6 +561,62 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
             probe.assert_not_called()
         host.assert_called_once()
         self.assertIn("lifecycle change", errors.getvalue())
+
+    def test_installed_owner_reader_uses_durable_profile_and_live_desktop_identity(self):
+        root = self.root / "installed-owner"
+        root.mkdir(mode=0o700)
+        for name in ("inventory", "discovery", "results"):
+            (root / name).mkdir(mode=0o700)
+        shutil.copy2(self.inventory.database, root / "inventory" / self.inventory.database.name)
+        settings = self.index_settings()
+        stored = self.write_private(root / "discovery" / "settings.json", settings)
+        expected = self.index(stale_offset=86401)
+        projection = store_projection(stored.parent, expected.projection)
+        for src in expected.cache.parent.glob(expected.cache.name + "*"):
+            name = src.name.replace(expected.cache.name, "snapshot.json", 1)
+            shutil.copy2(src, stored.parent / name)
+        descriptor = {"schema": host.OWNER_SESSION_SCHEMA, "operation": "proof",
+                      "skills_revision": SKILLS_REVISION, "projection_digest": projection.manifest_digest,
+                      "physical_bindings": [asdict(binding) for binding in self.physical.entries]}
+        self.write_private(root / "owner-session.json", encode(descriptor))
+
+        local_project = {"projectId": "fixture-project", "projectKind": "local", "hostId": "local",
+                         "isGitRepository": True, "label": "Sample Product", "path": self.primary.checkout}
+        list_projects = Mock(return_value={"schemaVersion": 2, "projects": [local_project]})
+        thread = {"id": "fixture-thread", "kind": "codex", "hostId": "local", "cwd": self.linked.checkout}
+        linked = Mock(return_value=(thread | {"projectId": "fixture-project"}, thread))
+        owner = self.command_owner()
+        reader = DesktopReader(list_projects, linked)
+        args = ["adopt", self.linked.checkout, "--project-id", "fixture-project", "--thread-id", "fixture-thread"]
+        output, errors = StringIO(), StringIO()
+        self.assertEqual(host.run_installed(args, owner_state=root, read_native=reader, read_hosting=self.hosting,
+                                            read_delivery=owner.read_delivery, output=output, errors=errors),
+                         0, errors.getvalue())
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["checkout"], self.linked.checkout)
+        self.assertEqual(result["discovery"]["snapshot_generation"], 2)
+        self.assertEqual(list_projects.call_count, 4)
+        self.assertEqual(linked.call_count, 4)
+        accepted, = (root / "results").glob("adoption-*.json")
+        previous = accepted.read_bytes()
+
+        list_projects.reset_mock()
+        self.write_private(stored, self.index_settings(optional_missing=True))
+        with patch("repo_platform.adoption.pin_checkout") as probe:
+            refusal, error = StringIO(), StringIO()
+            self.assertEqual(host.run_installed(args, owner_state=root, read_native=reader, read_hosting=self.hosting,
+                                                read_delivery=owner.read_delivery, output=refusal, errors=error), 1)
+            probe.assert_not_called()
+        self.assertEqual(refusal.getvalue(), "")
+        self.assertIn("installed Dev owner state is unavailable", error.getvalue())
+        list_projects.assert_not_called()
+        self.assertEqual(accepted.read_bytes(), previous)
+
+    @staticmethod
+    def write_private(path, content):
+        path.write_bytes(content)
+        path.chmod(0o600)
+        return path
 
     def test_index_joins_one_repository_and_clone_with_two_worktrees(self):
         index = self.index(optional_missing=True)
