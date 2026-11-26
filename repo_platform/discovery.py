@@ -11,6 +11,7 @@ from lib.deadline import deadline
 from lib.engine import query
 from lib.receipt_store import load_qualified_snapshot
 from personal_checkout_inventory import Refused
+from repo_platform.recovery import DiscoveryRepairRequired
 from skills_inventory_projection import Projection, guarded_admission
 
 
@@ -51,21 +52,40 @@ class SkillsDiscovery:
     cache: os.PathLike | str
     skills_revision: str
 
+    def refreshed_reference(self, inventory, version, physical, expires):
+        """Read a fresh owner-bound receipt after an earlier Skills diagnosis."""
+        remaining = min(2, expires - time.monotonic())
+        if remaining <= 0 or self.projection.version != version:
+            return None
+        admission = guarded_admission(inventory, self.projection, self.skills_revision, physical=physical)
+        try:
+            with deadline(remaining):
+                snapshot, receipt = load_qualified_snapshot(os.fspath(self.cache), admission)
+                if _current(snapshot["observed_at"], datetime.now(timezone.utc)):
+                    return receipt["snapshot_digest"]
+        except Refusal:
+            pass
+        return None
+
     def qualify(self, *, inventory, version, rows, binding, physical, hosted, expires):
         """Read inside the caller's current Dev adoption guard."""
         if self.projection.version != version:
-            raise Refused("the Skills index has an older Dev binding; refresh the current projection")
+            raise DiscoveryRepairRequired("the Skills index has an older Dev binding; refresh the current projection")
         remaining = expires - time.monotonic()
         if remaining <= 0:
             raise Refused("the Skills index check exceeded the adoption read budget")
         admission = guarded_admission(inventory, self.projection, self.skills_revision, physical=physical)
+        receipt = None
         try:
             with deadline(remaining):
                 snapshot, receipt = load_qualified_snapshot(os.fspath(self.cache), admission)
                 roots = admission.validate()["roots"]
                 return _selected(snapshot, receipt, roots, self.projection.omitted, rows, binding, hosted)
         except Refusal as error:
-            raise Refused(f"the Skills index receipt or read is unavailable ({error.code}); check the owner refresh") from error
+            raise DiscoveryRepairRequired(
+                f"the Skills index receipt or read is unavailable ({error.code}); check the owner refresh",
+                snapshot_digest=receipt["snapshot_digest"] if receipt is not None else None,
+            ) from error
 
 
 def _current(stamp, now):
@@ -90,7 +110,10 @@ def _shares_location(row, binding):
 def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted):
     now = datetime.now(timezone.utc)
     if not _current(snapshot["observed_at"], now):
-        raise Refused("the Skills snapshot is stale or future-dated; refresh the current projection")
+        raise DiscoveryRepairRequired(
+            "the Skills snapshot is stale or future-dated; refresh the current projection",
+            snapshot_digest=receipt["snapshot_digest"],
+        )
 
     provider = f"{binding.provider}:{binding.repository_id}"
     repository = typed("repository", "provider:" + provider)

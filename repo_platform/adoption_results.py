@@ -48,40 +48,47 @@ class AdoptionResults:
         data = encode({"schema": RESULT_SCHEMA, "result": asdict(result)})
         if len(data) > MAX_RESULT_BYTES:
             raise Refused("the private adoption result exceeds its publication limit")
-        switched = False
         try:
             # Reuse the Skills owner lock protocol. Its flock is released on
             # process exit, including an interruption before atomic replacement.
             with AdmittedPublisher(destination, MAX_RESULT_BYTES) as slot:
                 if _reference(slot.fd, slot.name, selection) != expected:
                     raise Refused("another command published a newer adoption result; run a fresh preview")
-                staged = "." + slot.name + ".pending"
-                _discard_interrupted_stage(slot.fd, staged)
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-                staged_fd = os.open(staged, flags, 0o600, dir_fd=slot.fd)
-                try:
-                    with os.fdopen(staged_fd, "wb") as stream:
-                        stream.write(data)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    if read_at(slot.fd, staged, MAX_RESULT_BYTES, True) != data:
-                        raise Refused("the staged adoption result could not be verified")
-                    if time.monotonic() >= expires:
-                        raise Refused("the Dev adoption publication budget expired")
-                    os.replace(staged, slot.name, src_dir_fd=slot.fd, dst_dir_fd=slot.fd)
-                    switched = True
-                    os.fsync(slot.fd)
-                    if read_at(slot.fd, slot.name, MAX_RESULT_BYTES, True) != data:
-                        raise Refused("the adoption result changed during publication")
-                finally:
-                    if not switched:
-                        os.unlink(staged, dir_fd=slot.fd)
-        except (Refusal, OSError, Refused) as error:
-            if switched:
-                raise Refused("the adoption publication switched but readback failed; recheck its private result") from error
-            if isinstance(error, Refused):
-                raise
+                replace_private_record(slot, data, expires=expires)
+        except (Refusal, OSError) as error:
             raise Refused("the private adoption result could not be published safely") from error
+
+
+def replace_private_record(slot, data, *, expires=None):
+    """Replace one bounded record under its caller's private publisher lock."""
+    if len(data) > slot.maximum:
+        raise Refused("the private record exceeds its publication limit")
+    staged = "." + slot.name + ".pending"
+    _discard_interrupted_stage(slot.fd, staged)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    staged_fd = os.open(staged, flags, 0o600, dir_fd=slot.fd)
+    switched = False
+    try:
+        with os.fdopen(staged_fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if read_at(slot.fd, staged, slot.maximum, True) != data:
+            raise Refused("the staged private record could not be verified")
+        if expires is not None and time.monotonic() >= expires:
+            raise Refused("the Dev adoption publication budget expired")
+        os.replace(staged, slot.name, src_dir_fd=slot.fd, dst_dir_fd=slot.fd)
+        switched = True
+        os.fsync(slot.fd)
+        if read_at(slot.fd, slot.name, slot.maximum, True) != data:
+            raise Refused("the private record changed during publication")
+    except (Refusal, OSError, Refused) as error:
+        if switched:
+            raise Refused("the private record switched but readback failed; recheck it before retrying") from error
+        raise
+    finally:
+        if not switched:
+            os.unlink(staged, dir_fd=slot.fd)
 
 
 def _discard_interrupted_stage(fd, name):

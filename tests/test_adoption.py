@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from github_checkout_provider import GitHubRepositoryObservation
+from github_checkout_provider import GitHubRepositoryObservation, TransientProviderRead
 from issue_checkout_evidence import issue_checkout_evidence_reissue, observe_checkout_authorities
 from lib.contracts import encode
 from lib.engine import refresh_admitted
@@ -282,10 +282,15 @@ class AdoptionTests(unittest.TestCase):
         owner = self.command_owner()
         args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
         output, errors = StringIO(), StringIO()
-        winning_output = StringIO()
+        winner = []
 
         def publish_first(repository_id, *, deadline):
-            self.assertEqual(command.run(args, owner=owner, output=winning_output, errors=errors), 0)
+            winner.append(adoption.preview(
+                owner.inventory, self.primary.checkout, "fixture-project", owner.operation,
+                physical=owner.physical, read_native=self.native, read_hosting=owner.read_hosting,
+                read_delivery=owner.read_delivery, deadline=deadline, discovery=owner.discovery,
+                results=owner.results, expected_title="Earlier publication",
+            ))
             return self.hosting(repository_id, deadline=deadline)
 
         slower = replace(owner, read_hosting=publish_first)
@@ -293,7 +298,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
         self.assertIn("another command published", errors.getvalue())
         stored, = owner.results.path.glob("adoption-*.json")
-        self.assertEqual(json.loads(stored.read_bytes())["result"], json.loads(winning_output.getvalue()))
+        self.assertEqual(json.loads(stored.read_bytes())["result"]["warnings"], list(winner[0].warnings))
 
     def test_retirement_during_recheck_preserves_the_accepted_disk_result(self):
         owner = self.command_owner()
@@ -357,6 +362,120 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual(list(owner.results.path.glob(".*.pending")), [])
         self.assertEqual(json.loads(stored.read_bytes())["result"], json.loads(output.getvalue()))
+
+    def test_transient_hosting_retry_rechecks_native_selection_and_clears_recovery_case(self):
+        owner = self.command_owner()
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        host = Mock(side_effect=[TransientProviderRead("fixture transport timeout"),
+                                 self.hosting(73, deadline=time.monotonic() + 2)])
+        native = Mock(side_effect=owner.read_native)
+        owner = replace(owner, read_hosting=host, read_native=native)
+        output, errors = StringIO(), StringIO()
+        clock = [100.0]
+        with patch("repo_platform.recovery.time", side_effect=lambda: clock[0]), patch(
+            "repo_platform.recovery.sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)
+        ) as wait:
+            self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 0)
+        wait.assert_called_once_with(2)
+        self.assertEqual(native.call_count, 3)
+        self.assertEqual(host.call_count, 2)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(json.loads(output.getvalue())["repository_id"], 73)
+        self.assertEqual(list(owner.results.path.glob("recovery-*.json")), [])
+
+    def test_exhausted_case_uses_two_delays_and_refuses_restart_without_fresh_evidence(self):
+        owner = self.command_owner()
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        host = Mock(side_effect=TransientProviderRead("fixture transport timeout"))
+        owner = replace(owner, read_hosting=host)
+        clock = [100.0]
+        errors = StringIO()
+        with patch("repo_platform.recovery.time", side_effect=lambda: clock[0]), patch(
+            "repo_platform.recovery.sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)
+        ) as wait:
+            self.assertEqual(command.run(args, owner=owner, output=StringIO(), errors=errors), 1)
+            reopened = replace(owner, inventory=Inventory(owner.inventory.directory),
+                               results=AdoptionResults(owner.results.path))
+            self.assertEqual(command.run(args, owner=reopened, output=StringIO(), errors=errors), 1)
+        self.assertEqual([call.args[0] for call in wait.call_args_list], [2, 5])
+        self.assertEqual(host.call_count, 3)
+        self.assertIn("Codex diagnosis required after 3 attempt(s)", errors.getvalue())
+        case, = owner.results.path.glob("recovery-*.json")
+        case_record = json.loads(case.read_bytes())
+        self.assertEqual(case_record["attempts"], 3)
+        self.assertEqual(case_record["elapsed_ms"], 7000)
+        self.assertEqual(case_record["state"], "diagnose")
+        advanced = replace(owner, read_hosting=self.hosting, discovery=self.index(optional_missing=True))
+        advanced_errors = StringIO()
+        self.assertEqual(command.run(args, owner=advanced, output=StringIO(), errors=advanced_errors),
+                         0, advanced_errors.getvalue())
+        self.assertFalse(case.exists())
+
+    def test_stale_skills_snapshot_goes_straight_to_owner_diagnosis(self):
+        owner = replace(self.command_owner(), discovery=self.index(stale_offset=86401))
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        errors = StringIO()
+        with patch("repo_platform.recovery.sleep") as wait, patch("repo_platform.adoption.pin_checkout") as probe:
+            self.assertEqual(command.run(args, owner=owner, output=StringIO(), errors=errors), 1)
+            wait.assert_not_called()
+            probe.assert_not_called()
+        case, = owner.results.path.glob("recovery-*.json")
+        record = json.loads(case.read_bytes())
+        self.assertEqual((record["attempts"], record["kind"]), (1, "skills-refresh"))
+        self.assertIn("Skills refresh owner", errors.getvalue())
+        hosted = Mock(side_effect=owner.read_hosting)
+        owner = replace(owner, read_hosting=hosted)
+        self.assertEqual(command.run(args, owner=owner, output=StringIO(), errors=StringIO()), 1)
+        hosted.assert_not_called()
+        stored = store_projection(self.root / "authority", owner.discovery.projection)
+        admission = guarded_admission(self.inventory, owner.discovery.projection, SKILLS_REVISION,
+                                     physical=self.physical)
+        refreshed = refresh_admitted(str(stored.config), str(owner.discovery.cache), admission)
+        self.assertNotEqual(refreshed["result"]["snapshot_digest"], record["failed_snapshot"])
+        self.assertEqual(command.run(args, owner=owner, output=StringIO(), errors=StringIO()), 0)
+        hosted.assert_called_once()
+        self.assertFalse(case.exists())
+
+    def test_elapsed_budget_stops_before_a_retry(self):
+        owner = self.command_owner()
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        clock = [100.0]
+
+        def slow_transport(repository_id, *, deadline):
+            clock[0] += 89
+            raise TransientProviderRead("fixture transport timeout")
+
+        host = Mock(side_effect=slow_transport)
+        errors = StringIO()
+        with patch("repo_platform.recovery.time", side_effect=lambda: clock[0]), patch(
+            "repo_platform.recovery.sleep"
+        ) as wait:
+            self.assertEqual(command.run(args, owner=replace(owner, read_hosting=host),
+                                         output=StringIO(), errors=errors), 1)
+        wait.assert_not_called()
+        host.assert_called_once()
+        self.assertIn("Codex diagnosis required after 1 attempt(s)", errors.getvalue())
+
+    def test_retirement_while_retry_waits_stops_next_hosting_read(self):
+        owner = self.command_owner()
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        clock = [100.0]
+        host = Mock(side_effect=TransientProviderRead("fixture transport timeout"))
+
+        def reserve_during_backoff(delay):
+            clock[0] += delay
+            self.inventory.reserve(self.version, "retirement", {self.primary.checkout: None},
+                                   deadline=time.monotonic() + 2)
+
+        errors = StringIO()
+        with patch("repo_platform.recovery.time", side_effect=lambda: clock[0]), patch(
+            "repo_platform.recovery.sleep", side_effect=reserve_during_backoff
+        ), patch("repo_platform.adoption.pin_checkout") as probe:
+            self.assertEqual(command.run(args, owner=replace(owner, read_hosting=host),
+                                         output=StringIO(), errors=errors), 1)
+            probe.assert_not_called()
+        host.assert_called_once()
+        self.assertIn("lifecycle change", errors.getvalue())
 
     def test_index_joins_one_repository_and_clone_with_two_worktrees(self):
         index = self.index(optional_missing=True)

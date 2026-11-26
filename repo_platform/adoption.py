@@ -116,7 +116,8 @@ def _local_head(binding, reader):
 
 def preview(inventory, checkout, project_id, owner_operation, *, physical,
             read_native, read_hosting, deadline, thread_id=None, expected_title=None,
-            expected_repository_id=None, read_delivery=None, discovery=None, results=None):
+            expected_repository_id=None, read_delivery=None, discovery=None, results=None,
+            begin_attempt=None):
     """Qualify one checkout and optionally record the result without changing the checkout."""
     checkout = lexical(checkout)
     selected = selection_digest(project_id, checkout, thread_id)
@@ -144,6 +145,8 @@ def preview(inventory, checkout, project_id, owner_operation, *, physical,
         raise Refused("the native selection must identify the admitted primary or linked checkout")
     if not binding.linked_metadata() and binding.git_directory != checkout + "/.git":
         raise Refused("the primary checkout does not have an admitted in-place Git directory")
+    if begin_attempt is not None:
+        deadline = min(deadline, begin_attempt(version))
     expected_result = results.reference(selected) if results is not None else None
 
     scope = inventory.current_owner_evidence(

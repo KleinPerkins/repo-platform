@@ -5,17 +5,15 @@ from dataclasses import asdict, dataclass
 from functools import partial
 import json
 import sys
-import time
 from typing import Callable
 
+from native_checkout_project import selection_digest
 from personal_checkout_inventory import Inventory, Refused
 from physical_checkout_binding import OwnerPhysicalBindings
 from repo_platform.adoption import preview
 from repo_platform.adoption_results import AdoptionResults
 from repo_platform.discovery import SkillsDiscovery
-
-
-ADOPTION_BUDGET_SECONDS = 90
+from repo_platform.recovery import RecoveryCase
 
 
 @dataclass(frozen=True)
@@ -51,14 +49,25 @@ def run(argv, *, owner: OwnerSession, output=None, errors=None):
             raise Refused("the Dev owner session has no qualified Skills index reader")
         if not isinstance(owner.results, AdoptionResults):
             raise Refused("the Dev owner session has no private adoption result store")
-        result = preview(
-            owner.inventory, args.checkout, args.project_id, owner.operation,
-            physical=owner.physical, read_native=partial(owner.read_native, thread_id=args.thread_id),
-            read_hosting=owner.read_hosting, read_delivery=owner.read_delivery,
-            deadline=time.monotonic() + ADOPTION_BUDGET_SECONDS, thread_id=args.thread_id,
-            expected_title=args.expected_title, expected_repository_id=args.repository_id,
-            discovery=owner.discovery, results=owner.results,
-        )
+        selected = selection_digest(args.project_id, args.checkout, args.thread_id)
+
+        def refreshed_snapshot(version, expires):
+            return owner.discovery.refreshed_reference(owner.inventory, version, owner.physical, expires)
+
+        recovery = RecoveryCase(owner.results.path, selected, owner.discovery.projection,
+                                owner.discovery.skills_revision, owner.operation, refreshed_snapshot)
+
+        def verify(deadline, begin_attempt):
+            return preview(
+                owner.inventory, args.checkout, args.project_id, owner.operation,
+                physical=owner.physical, read_native=partial(owner.read_native, thread_id=args.thread_id),
+                read_hosting=owner.read_hosting, read_delivery=owner.read_delivery,
+                deadline=deadline, thread_id=args.thread_id,
+                expected_title=args.expected_title, expected_repository_id=args.repository_id,
+                discovery=owner.discovery, results=owner.results, begin_attempt=begin_attempt,
+            )
+
+        result = recovery.run(verify)
     except Refused as error:
         print(f"Checkout adoption refused. {error}", file=errors if errors is not None else sys.stderr)
         return 1
