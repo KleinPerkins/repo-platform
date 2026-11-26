@@ -189,6 +189,122 @@ class AdoptionTests(unittest.TestCase):
                 self.select(self.primary.checkout, read_hosting=different_provider)
             probe.assert_not_called()
 
+    def test_same_name_fork_and_shallow_clone_keep_their_own_checkout_bindings(self):
+        upstream = Path(self.primary.checkout)
+        peer = Path(self.peer.checkout)
+        for checkout in (upstream, peer):
+            git(checkout, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "--allow-empty", "-m", "Commit " + checkout.parent.name)
+        shallow, fork = (self.root / kind / upstream.name for kind in ("shallow", "fork"))
+        for path, options, remote in (
+            (shallow, ("--depth=1",), "example/sample.product"),
+            (fork, (), "fork-owner/sample.product"),
+        ):
+            path.parent.mkdir()
+            git(self.root, "clone", "--no-local", *options, str(upstream), str(path))
+            git(path, "remote", "set-url", "origin", "https://github.com/" + remote + ".git")
+        self.assertEqual(git(upstream, "rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(git(fork, "rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(git(shallow, "rev-parse", "--is-shallow-repository"), "true")
+        self.assertEqual(git(shallow, "rev-list", "--count", "HEAD"), "1")
+        shared_head = git(upstream, "rev-parse", "HEAD")
+        self.assertEqual(git(fork, "rev-parse", "HEAD"), shared_head)
+        self.assertEqual(git(shallow, "rev-parse", "HEAD"), shared_head)
+        self.assertNotEqual(git(peer, "rev-parse", "HEAD"), shared_head)
+
+        names = {73: "example/sample.product", 74: "other/sample.product", 75: "fork-owner/sample.product"}
+        titles = {str(path): upstream.name for path in (upstream, peer, shallow, fork)}
+        titles[str(shallow)] = "Sample product shallow checkout"
+        bindings = {}
+        proofs = []
+        roots = []
+        for key, path, repository_id in (("upstream", upstream, 73), ("peer", peer, 74),
+                                          ("shallow", shallow, 73), ("fork", fork, 75)):
+            gitdir = str(path / ".git")
+            binding = Binding(str(path), gitdir, gitdir, "github", repository_id, key, key, ("adopt", "enumerate"))
+            bindings[str(path)] = binding
+            locations = []
+            for role in ROLES:
+                value = getattr(binding, role)
+                stat = Path(value).lstat()
+                locations.append((role, value, stat.st_dev, stat.st_ino))
+            proofs.append(OwnerPhysicalBinding("github", repository_id, key, key, tuple(locations)))
+            roots.append({"key": key, "path": str(path), "scope": "permitted", "inventory": "native",
+                          "title": titles[str(path)], "aliases": [], "storage_fields": ["title"], "sources": [],
+                          "identity": {"provider": None, "remote": "https://github.com/" + names[repository_id]},
+                          "git": {"common_dir": gitdir, "git_dir": gitdir}})
+
+        storage = self.root / "shared-history-authority"
+        storage.mkdir(mode=0o700)
+        inventory = Inventory(storage)
+        generation = inventory.initialize("fixture-host", "fixture-policy", [self.denied], bindings.values())
+        physical = OwnerPhysicalBindings(tuple(proofs))
+        selections = {path: "fixture-" + binding.worktree_id for path, binding in bindings.items()}
+        operation = "qualify-shared-history"
+
+        def read_native(project_id, checkout, *, deadline, thread_id=None):
+            self.assertEqual(selections[checkout], project_id)
+            self.assertIsNone(thread_id)
+            return NativeProjectBinding(project_id, checkout, titles[checkout], None, int(time.time()), thread_id)
+
+        def read_hosting(repository_id, *, deadline):
+            return replace(self.hosting(repository_id, deadline=deadline), full_name=names[repository_id])
+
+        deadline = time.monotonic() + 10
+        observations = observe_checkout_authorities(
+            selections, repository_ids={path: binding.repository_id for path, binding in bindings.items()},
+            read_native=read_native, read_hosting=read_hosting, deadline=deadline,
+        )
+        version = issue_checkout_evidence_reissue(
+            inventory, generation, operation, selections, observations, physical=physical, deadline=deadline,
+        )
+        settings = json.loads(self.index_settings())
+        settings["roots"] = roots
+        settings["bounds"]["roots"] = len(roots)
+        projection = project_inventory(inventory, version, encode(settings), deadline=deadline)
+        stored = store_projection(storage, projection)
+        cache = storage / "index.json"
+        refresh_admitted(str(stored.config), str(cache),
+                         guarded_admission(inventory, projection, SKILLS_REVISION, physical=physical))
+        owner = command.OwnerSession(
+            inventory, operation, physical, read_native, read_hosting,
+            lambda hosted, **_: adoption.DeliveryClassification(
+                hosted.repository_id, hosted.full_name, "private-no-ci", "fixture-policy",
+            ),
+            SkillsDiscovery(projection, cache, SKILLS_REVISION), AdoptionResults(storage),
+        )
+
+        accepted = {}
+        for path in (upstream, peer, shallow, fork):
+            args = ["adopt", str(path), "--project-id", selections[str(path)]]
+            output, errors = StringIO(), StringIO()
+            self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 0, errors.getvalue())
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["repository_id"], bindings[str(path)].repository_id)
+            self.assertEqual(result["project_title"], titles[str(path)])
+            self.assertEqual(result["local_head"], git(path, "rev-parse", "HEAD"))
+            self.assertEqual(result["hosted_default_head"], HOSTED_HEAD)
+            title_warnings = [warning for warning in result["warnings"] if "differing display titles" in warning]
+            self.assertEqual(len(title_warnings), int(path in (upstream, shallow)))
+            accepted[path] = result["discovery"]
+        self.assertEqual(accepted[upstream]["repository_entity"], accepted[shallow]["repository_entity"])
+        self.assertEqual(len({entry["repository_entity"] for entry in accepted.values()}), 3)
+        for entity in ("clone_entity", "worktree_entity"):
+            self.assertEqual(len({entry[entity] for entry in accepted.values()}), 4)
+
+        previous = {path.name: path.read_bytes() for path in storage.glob("adoption-*.json")}
+        self.assertEqual(len(previous), 4)
+        substitute = Mock(side_effect=lambda _, **kwargs: read_hosting(73, **kwargs))
+        errors = StringIO()
+        args = ["adopt", str(fork), "--project-id", selections[str(fork)], "--repository-id", "75"]
+        with patch("repo_platform.adoption.pin_checkout") as probe:
+            self.assertEqual(command.run(args, owner=replace(owner, read_hosting=substitute),
+                                         output=StringIO(), errors=errors), 1)
+            probe.assert_not_called()
+        substitute.assert_called_once()
+        self.assertIn("hosting identity", errors.getvalue())
+        self.assertEqual({path.name: path.read_bytes() for path in storage.glob("adoption-*.json")}, previous)
+
     def test_lifecycle_reservation_after_native_read_stops_target_probe(self):
         def reserve_retirement(repository_id, *, deadline):
             self.inventory.reserve(self.version, "retirement", {self.primary.checkout: None}, deadline=deadline)
