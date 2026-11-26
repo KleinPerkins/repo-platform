@@ -136,11 +136,20 @@ def _selected(snapshot, receipt, roots, omitted, inventory_rows, binding, hosted
         required.add(peer_key)
         if peer["git"] is not None:
             required.add(peer_key + "/git")
-    if required.intersection(receipt["input_diagnostics"]):
+    diagnostics = [receipt["input_diagnostics"][name] for name in required.intersection(receipt["input_diagnostics"])]
+    if any(item["state"] in {"conflict", "omitted"} for item in diagnostics):
         raise Refused("the Skills refresh reports an unresolved input for the selected identity")
+    if diagnostics:
+        raise DiscoveryRepairRequired(
+            "the Skills collector could not qualify a required checkout input",
+            snapshot_digest=receipt["snapshot_digest"],
+        )
     current_keys = {item["key"] for item in snapshot["inputs"] if item["state"] == "current"}
     if not required <= current_keys:
-        raise Refused("the Skills index lacks a current input for the selected identity")
+        raise DiscoveryRepairRequired(
+            "the Skills index lacks a current input for the selected identity",
+            snapshot_digest=receipt["snapshot_digest"],
+        )
 
     entities = {entity["id"]: entity for entity in snapshot["entities"]}
     selected_ids = (repository, clone, worktree)

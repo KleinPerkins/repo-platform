@@ -14,6 +14,7 @@ from repo_platform.adoption import preview
 from repo_platform.adoption_results import AdoptionResults
 from repo_platform.discovery import SkillsDiscovery
 from repo_platform.recovery import RecoveryCase
+from repo_platform.skills_repair import SkillsRepair
 
 
 @dataclass(frozen=True)
@@ -28,10 +29,11 @@ class OwnerSession:
     read_delivery: Callable
     discovery: SkillsDiscovery
     results: AdoptionResults
+    skills_repair: SkillsRepair | None = None
 
 
 def run(argv, *, owner: OwnerSession, output=None, errors=None):
-    """Run the read-only command within its caller's trusted owner session."""
+    """Run adoption within the caller's trusted owner session."""
     parser = argparse.ArgumentParser(prog="repo-platform")
     commands = parser.add_subparsers(dest="command", required=True)
     adopt = commands.add_parser("adopt", help="qualify and record one explicitly selected Codex checkout")
@@ -49,10 +51,17 @@ def run(argv, *, owner: OwnerSession, output=None, errors=None):
             raise Refused("the Dev owner session has no qualified Skills index reader")
         if not isinstance(owner.results, AdoptionResults):
             raise Refused("the Dev owner session has no private adoption result store")
+        if owner.skills_repair is not None and not isinstance(owner.skills_repair, SkillsRepair):
+            raise Refused("the Dev owner session has an invalid Skills repair binding")
         selected = selection_digest(args.project_id, args.checkout, args.thread_id)
 
         def refreshed_snapshot(version, expires):
             return owner.discovery.refreshed_reference(owner.inventory, version, owner.physical, expires)
+
+        repair = None
+        if owner.skills_repair is not None:
+            repair = partial(owner.skills_repair.refresh, owner.discovery, inventory=owner.inventory,
+                             operation=owner.operation, physical=owner.physical)
 
         recovery = RecoveryCase(owner.results.path, selected, owner.discovery.projection,
                                 owner.discovery.skills_revision, owner.operation, refreshed_snapshot)
@@ -67,7 +76,7 @@ def run(argv, *, owner: OwnerSession, output=None, errors=None):
                 discovery=owner.discovery, results=owner.results, begin_attempt=begin_attempt,
             )
 
-        result = recovery.run(verify)
+        result = recovery.run(verify, repair_skills=repair)
     except Refused as error:
         print(f"Checkout adoption refused. {error}", file=errors if errors is not None else sys.stderr)
         return 1

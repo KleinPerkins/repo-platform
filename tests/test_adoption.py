@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 from github_checkout_provider import GitHubRepositoryObservation, TransientProviderRead
 from issue_checkout_evidence import issue_checkout_evidence_reissue, observe_checkout_authorities
-from lib.contracts import encode
+from lib.contracts import Refusal as SkillsRefusal, encode
 from lib.engine import refresh_admitted
 from native_checkout_project import NativeProjectBinding
 from personal_checkout_inventory import Binding, Inventory, Refused
@@ -20,6 +20,7 @@ from physical_checkout_binding import OwnerPhysicalBinding, OwnerPhysicalBinding
 from repo_platform import adoption, command
 from repo_platform.adoption_results import AdoptionResults
 from repo_platform.discovery import SkillsDiscovery
+from repo_platform.skills_repair import SkillsRepair
 from skills_inventory_projection import guarded_admission, project_inventory, store_projection
 
 
@@ -102,9 +103,7 @@ class AdoptionTests(unittest.TestCase):
             discovery=discovery,
         )
 
-    def index(self, *, stale_offset=0, bad_origin=False, optional_missing=False,
-              conflicting_alias=False, publish=True):
-        storage = self.root / "authority"
+    def index_settings(self, *, bad_origin=False, optional_missing=False, conflicting_alias=False):
         config = {"schema": "ecosystem-index/config/v1", "exclude_paths": [], "exclude_identities": [],
                   "bounds": {"roots": 3, "entities": 32, "input_bytes": 65536,
                              "snapshot_bytes": 1048576, "refresh_seconds": 10}, "roots": []}
@@ -123,7 +122,14 @@ class AdoptionTests(unittest.TestCase):
                 root["storage_fields"].append("aliases")
                 root["aliases"] = [self.primary.checkout]
             config["roots"].append(root)
-        projection = project_inventory(self.inventory, self.version, encode(config), deadline=time.monotonic() + 2)
+        return encode(config)
+
+    def index(self, *, stale_offset=0, bad_origin=False, optional_missing=False,
+              conflicting_alias=False, publish=True):
+        storage = self.root / "authority"
+        trusted_settings = self.index_settings(bad_origin=bad_origin, optional_missing=optional_missing,
+                                               conflicting_alias=conflicting_alias)
+        projection = project_inventory(self.inventory, self.version, trusted_settings, deadline=time.monotonic() + 2)
         cache = storage / ("cache-" + projection.config_digest() + f"-{stale_offset}.json")
         if publish:
             stored = store_projection(storage, projection)
@@ -455,6 +461,83 @@ with patch("repo_platform.adoption_results.os.replace", side_effect=lambda *a, *
         wait.assert_not_called()
         host.assert_called_once()
         self.assertIn("Codex diagnosis required after 1 attempt(s)", errors.getvalue())
+
+    def test_owner_refresh_repairs_stale_skills_and_reruns_full_adoption(self):
+        index = self.index(stale_offset=86401)
+        repair = SkillsRepair(self.index_settings(), self.root / "authority")
+        owner = replace(self.command_owner(), discovery=index, skills_repair=repair)
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        host = Mock(side_effect=owner.read_hosting)
+        native = Mock(side_effect=owner.read_native)
+        owner = replace(owner, read_hosting=host, read_native=native)
+        old = index.cache.read_bytes()
+        output, errors = StringIO(), StringIO()
+        self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 0, errors.getvalue())
+        self.assertEqual(host.call_count, 2)
+        self.assertEqual(native.call_count, 4)
+        self.assertEqual(json.loads(output.getvalue())["discovery"]["snapshot_generation"], 2)
+        self.assertNotEqual(index.cache.read_bytes(), old)
+        self.assertEqual(list(owner.results.path.glob("recovery-*.json")), [])
+
+    def test_owner_refresh_recovers_a_failed_required_collector(self):
+        with patch("lib.engine.git_records", side_effect=SkillsRefusal("source_failed", 3)):
+            index = self.index()
+        old = index.cache.read_bytes()
+        owner = replace(self.command_owner(), discovery=index,
+                        skills_repair=SkillsRepair(self.index_settings(), self.root / "authority"))
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        output, errors = StringIO(), StringIO()
+        self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 0, errors.getvalue())
+        observed = json.loads(output.getvalue())["discovery"]
+        self.assertEqual(observed["coverage"], "complete")
+        self.assertEqual(observed["snapshot_generation"], 2)
+        self.assertNotEqual(index.cache.read_bytes(), old)
+
+    def test_refused_repair_preserves_prior_result_and_is_not_repeated_on_restart(self):
+        owner = replace(self.command_owner(), skills_repair=SkillsRepair(self.index_settings(),
+                                                                        self.root / "authority"))
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        self.assertEqual(command.run(args, owner=owner, output=StringIO(), errors=StringIO()), 0)
+        stored, = owner.results.path.glob("adoption-*.json")
+        accepted = stored.read_bytes()
+        corrupt = b"partial snapshot fixture\n"
+        with owner.discovery.cache.open("wb") as file:
+            file.write(corrupt)
+        errors, output = StringIO(), StringIO()
+        with patch("repo_platform.skills_repair.refresh_admitted", wraps=refresh_admitted) as refresh:
+            self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 1)
+            reopened = replace(owner, inventory=Inventory(self.inventory.directory),
+                               results=AdoptionResults(owner.results.path))
+            self.assertEqual(command.run(args, owner=reopened, output=output, errors=errors), 1)
+        refresh.assert_called_once()
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("the owner-supported Skills refresh refused (unavailable)", errors.getvalue())
+        self.assertEqual(stored.read_bytes(), accepted)
+        self.assertEqual(owner.discovery.cache.read_bytes(), corrupt)
+        case, = owner.results.path.glob("recovery-*.json")
+        self.assertTrue(json.loads(case.read_bytes())["repair_attempted"])
+
+    def test_retirement_before_skills_repair_stops_all_additional_target_access(self):
+        repair = SkillsRepair(self.index_settings(), self.root / "authority")
+        owner = replace(self.command_owner(), discovery=self.index(stale_offset=86401), skills_repair=repair)
+        args = ["adopt", self.primary.checkout, "--project-id", "fixture-project"]
+        real_refresh = repair.refresh
+
+        def reserve_before_refresh(*args, **kwargs):
+            self.inventory.reserve(self.version, "retirement", {self.primary.checkout: None},
+                                   deadline=time.monotonic() + 2)
+            return real_refresh(*args, **kwargs)
+
+        output, errors = StringIO(), StringIO()
+        with patch.object(SkillsRepair, "refresh", side_effect=reserve_before_refresh) as requested, patch(
+            "repo_platform.skills_repair.refresh_admitted"
+        ) as refresh, patch("repo_platform.adoption.pin_checkout") as probe:
+            self.assertEqual(command.run(args, owner=owner, output=output, errors=errors), 1)
+            requested.assert_called_once()
+            refresh.assert_not_called()
+            probe.assert_not_called()
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("lifecycle change", errors.getvalue())
 
     def test_retirement_while_retry_waits_stops_next_hosting_read(self):
         owner = self.command_owner()

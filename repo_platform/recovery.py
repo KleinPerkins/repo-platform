@@ -50,7 +50,7 @@ class RecoveryCase:
         self.slot = None
         self.record = None
 
-    def run(self, verify):
+    def run(self, verify, repair_skills=None):
         """Run the full preview for every eligible attempt."""
         with self.resources:
             try:
@@ -58,10 +58,9 @@ class RecoveryCase:
                     try:
                         result = verify(self.deadline, self.begin_attempt)
                     except TransientProviderRead as error:
-                        self.record_failure("hosting-transport", str(error), retry=True)
+                        self.record_transport_failure(error)
                     except DiscoveryRepairRequired as error:
-                        self.record_failure("skills-refresh", str(error), retry=False,
-                                            snapshot_digest=error.snapshot_digest)
+                        self.handle_discovery_failure(error, repair_skills)
                     except DiagnosisRequired:
                         raise
                     except Refused:
@@ -119,16 +118,37 @@ class RecoveryCase:
         self.save()
         return attempt_deadline
 
-    def record_failure(self, kind, reason, *, retry, snapshot_digest=None):
+    def record_transport_failure(self, error):
         if self.record is None:
-            raise DiagnosisRequired(reason)
-        self.record.update(kind=kind, reason=reason, state="retry")
-        if snapshot_digest is not None:
-            self.record["failed_snapshot"] = snapshot_digest
+            raise DiagnosisRequired(str(error))
+        self.record.update(kind="hosting-transport", reason=str(error), state="retry")
         attempt = self.record["attempts"]
-        if not retry or attempt >= MAX_ATTEMPTS:
+        if attempt >= MAX_ATTEMPTS:
             self.require_diagnosis()
         self.record["ready_ms"] = clock_ms() + DELAYS[attempt - 1] * MILLISECONDS
+        self.save()
+
+    def handle_discovery_failure(self, error, repair_skills):
+        if self.record is None:
+            raise DiagnosisRequired(str(error))
+        self.record.update(kind="skills-refresh", reason=str(error), state="diagnose",
+                           failed_snapshot=error.snapshot_digest)
+        if repair_skills is None or self.record.get("repair_attempted"):
+            self.require_diagnosis()
+
+        # Record the repair before invoking the owner. A restart can verify
+        # completed publication but cannot repeat an interrupted repair blindly.
+        self.record["repair_attempted"] = True
+        self.save()
+        version = tuple(self.record["evidence"]["dev_version"])
+        try:
+            refreshed = repair_skills(version=version, failed_snapshot=error.snapshot_digest, expires=self.deadline)
+            if not refreshed or refreshed == error.snapshot_digest:
+                raise Refused("the Skills refresh returned no changed, qualified receipt")
+        except Refused as repair_error:
+            self.record["reason"] = f"{error} Owner refresh result. {repair_error}"
+            self.require_diagnosis()
+        self.record.update(state="retry", ready_ms=clock_ms(), refreshed_snapshot=refreshed)
         self.save()
 
     def require_diagnosis(self):
