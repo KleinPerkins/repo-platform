@@ -1,8 +1,23 @@
 {
   "schema": "g1-review-enrollments/v1",
   "repository_id": 1472074383,
-  "enabled": false,
-  "producers": [],
+  "enabled": true,
+  "producers": [
+    {
+      "id": "enrollment-e876e8eb",
+      "origin_account": "origin-6a644d43",
+      "enabled": true,
+      "github_user_id": 49759187,
+      "cli_version": "codex-cli 0.148.0",
+      "credential_store": "file",
+      "instructions_sha256": "7efd718dd897e06155b8e49eca37d18b15fb1e47610d9cf4b2d26e294a99e10b",
+      "capture_adapter_sha256": "35ba7c95ddee79340e969bf7fdea672fa25689fa3cd757aca62700ff6d1f55d0",
+      "creation_adapter_sha256": "8d2f593894ad599ba410b8b434bb33522fd01b8700e947fa39cb23df8b95c97c",
+      "allowed_startup_notice_sha256": [
+        "b2fc6975a5637afa2ac999a3260fc7980db0be97b0474c7a8a14c57e18d4a6e1"
+      ]
+    }
+  ],
   "repository_names": [
     "KleinPerkins/repo-platform"
   ]

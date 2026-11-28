@@ -33,7 +33,9 @@
       ],
       "id": "recovery",
       "tests": [
-        "tests/test_ci_admission.py"
+        "tests/test_ci_admission.py",
+        "tests/test_create_review_pr.py",
+        "tests/test_local_review.py"
       ],
       "timeout_seconds": 120
     }
