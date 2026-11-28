@@ -30,3 +30,9 @@ agent-learnings.md
 ._*
 *.swp
 # END KleinPerkins/dev baseline
+
+# Doc-Warden's generated local planning entry points
+/.agents/skills/gsd-new-project/SKILL.md
+/.agents/skills/gsd-discuss-phase/SKILL.md
+/.agents/skills/gsd-plan-phase/SKILL.md
+/.agents/skills/gsd-validate-phase/SKILL.md

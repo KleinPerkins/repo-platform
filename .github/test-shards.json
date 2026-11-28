@@ -19,6 +19,7 @@
       ],
       "id": "adoption",
       "tests": [
+        "tests/test_adoption.py",
         "tests/test_foundation_identity.py"
       ],
       "timeout_seconds": 120
