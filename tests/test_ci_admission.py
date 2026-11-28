@@ -59,15 +59,27 @@ class CIAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "empty or incomplete"):
             self.aggregate()
 
-    def test_seed_only_exposes_read_only_app_qualification(self):
+    def test_personal_enrollment_binds_both_adapters_and_manual_dispatch_stays_read_only(self):
+        from hashlib import sha256
+
         policy = json.loads((ROOT / ".github/review-enrollments.json").read_bytes())
         workflow = json.loads((ROOT / ".github/workflows/reviewer-app.yml").read_bytes())
         self.assertEqual(policy["repository_id"], self.contract["repository_id"])
-        self.assertEqual(policy["producers"], [])
-        self.assertIs(policy["enabled"], False)
-        self.assertEqual(workflow["on"], {"workflow_dispatch": {}})
+        self.assertIs(policy["enabled"], True)
+        producer, = policy["producers"]
+        self.assertIs(producer["enabled"], True)
+        self.assertEqual(producer["github_user_id"], 49759187)
+        for name, key in (("local_review.py", "capture_adapter_sha256"),
+                          ("create_review_pr.py", "creation_adapter_sha256")):
+            self.assertEqual(sha256((ROOT / "scripts" / name).read_bytes()).hexdigest(), producer[key])
+        self.assertEqual(set(workflow["on"]), {"workflow_dispatch", "workflow_run", "issue_comment"})
         self.assertTrue(all(scope == "read" for scope in workflow["permissions"].values()))
-        for step in workflow["jobs"]["admit"]["steps"]:
-            self.assertNotIn("--write", step.get("run", ""))
-            self.assertTrue(all(value == "read" for key, value in step.get("with", {}).items()
-                                if key.startswith("permission-")))
+        steps = workflow["jobs"]["admit"]["steps"]
+        writers = [step for step in steps
+                   if "--write" in step.get("run", "")
+                   or any(key.startswith("permission-") and value == "write"
+                          for key, value in step.get("with", {}).items())]
+        self.assertEqual(len(writers), 2)
+        for step in writers:
+            self.assertIn("github.event_name != 'workflow_dispatch'", step["if"])
+            self.assertIn("vars.REVIEWER_APP_ENABLED == 'true'", step["if"])
