@@ -1,0 +1,181 @@
+{
+  "name": "CI",
+  "on": {
+    "pull_request": {
+      "branches": [
+        "main"
+      ],
+      "types": [
+        "opened",
+        "reopened",
+        "synchronize",
+        "ready_for_review"
+      ]
+    },
+    "push": {
+      "branches": [
+        "main"
+      ]
+    },
+    "workflow_dispatch": {}
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "concurrency": {
+    "group": "ci-${{ github.event.pull_request.number || github.ref }}",
+    "cancel-in-progress": true
+  },
+  "jobs": {
+    "adoption": {
+      "name": "adoption",
+      "runs-on": "macos-15",
+      "timeout-minutes": 10,
+      "outputs": {
+        "receipt": "${{ steps.verify.outputs.receipt }}"
+      },
+      "env": {
+        "CI_HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+        "CI_BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+        "REPO_PLATFORM_DEV_ROOT": "${{ github.workspace }}/_ci-dev"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": false,
+            "fetch-depth": 0
+          }
+        },
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "ref": "a74471e4692919970a7df54ab01534fe74e6c81a",
+            "persist-credentials": false,
+            "fetch-depth": 1,
+            "repository": "KleinPerkins/dev",
+            "path": "_ci-dev"
+          }
+        },
+        {
+          "name": "Install pinned Darwin Python 3.12.12",
+          "run": "set -euo pipefail\n# Standard macos-15 selects ARM64; macos-15-intel selects Intel.\n# GitHub runner reference: https://docs.github.com/en/actions/reference/runners/github-hosted-runners\n# Observed arm64 check and aarch64 runtime execution: https://github.com/KleinPerkins/dev/actions/runs/44053184227/job/133935806106\ntest \"$(uname -m)\" = arm64\nruntime_root=\"$(mktemp -d \"/private/tmp/dev-python.XXXXXX\")\"\narchive=\"$runtime_root/archive.tar.gz\"\ntrap 'rm -f \"$archive\"' EXIT\ncurl --fail --location --proto '=https' --tlsv1.2 --max-time 120 https://github.com/astral-sh/python-build-standalone/releases/download/20260127/cpython-3.12.12%2B20260127-aarch64-apple-darwin-install_only_stripped.tar.gz --output \"$archive\"\nprintf '%s  %s\\n' 'ce209e54ac17f731b5f257ff419b55a445fcf65035e303bbbc5708d67dfe59d8' \"$archive\" | shasum -a 256 --check\ntar -xzf \"$archive\" -C \"$runtime_root\"\n\"$runtime_root/python/bin/python3\" -I -c 'import sys; assert sys.version_info[:3] == (3, 12, 12)'\nprintf '%s\\n' \"$runtime_root/python/bin\" >> \"$GITHUB_PATH\""
+        },
+        {
+          "name": "Acquire the exact Skills index and parser",
+          "run": "python3 -I -B scripts/verify_hosted.py prepare",
+          "env": {
+            "REPO_PLATFORM_SKILLS_ROOT": "${{ runner.temp }}/repo-platform-skills-index"
+          }
+        },
+        {
+          "name": "Test adoption",
+          "id": "verify",
+          "run": "python3 -I -B scripts/verify_hosted.py shard --shard adoption",
+          "env": {
+            "REPO_PLATFORM_SKILLS_ROOT": "${{ runner.temp }}/repo-platform-skills-index"
+          }
+        }
+      ]
+    },
+    "recovery": {
+      "name": "recovery",
+      "runs-on": "macos-15",
+      "timeout-minutes": 10,
+      "outputs": {
+        "receipt": "${{ steps.verify.outputs.receipt }}"
+      },
+      "env": {
+        "CI_HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+        "CI_BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+        "REPO_PLATFORM_DEV_ROOT": "${{ github.workspace }}/_ci-dev"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": false,
+            "fetch-depth": 0
+          }
+        },
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "ref": "a74471e4692919970a7df54ab01534fe74e6c81a",
+            "persist-credentials": false,
+            "fetch-depth": 1,
+            "repository": "KleinPerkins/dev",
+            "path": "_ci-dev"
+          }
+        },
+        {
+          "name": "Install pinned Darwin Python 3.12.12",
+          "run": "set -euo pipefail\n# Standard macos-15 selects ARM64; macos-15-intel selects Intel.\n# GitHub runner reference: https://docs.github.com/en/actions/reference/runners/github-hosted-runners\n# Observed arm64 check and aarch64 runtime execution: https://github.com/KleinPerkins/dev/actions/runs/44053184227/job/133935806106\ntest \"$(uname -m)\" = arm64\nruntime_root=\"$(mktemp -d \"/private/tmp/dev-python.XXXXXX\")\"\narchive=\"$runtime_root/archive.tar.gz\"\ntrap 'rm -f \"$archive\"' EXIT\ncurl --fail --location --proto '=https' --tlsv1.2 --max-time 120 https://github.com/astral-sh/python-build-standalone/releases/download/20260127/cpython-3.12.12%2B20260127-aarch64-apple-darwin-install_only_stripped.tar.gz --output \"$archive\"\nprintf '%s  %s\\n' 'ce209e54ac17f731b5f257ff419b55a445fcf65035e303bbbc5708d67dfe59d8' \"$archive\" | shasum -a 256 --check\ntar -xzf \"$archive\" -C \"$runtime_root\"\n\"$runtime_root/python/bin/python3\" -I -c 'import sys; assert sys.version_info[:3] == (3, 12, 12)'\nprintf '%s\\n' \"$runtime_root/python/bin\" >> \"$GITHUB_PATH\""
+        },
+        {
+          "name": "Acquire the exact Skills index and parser",
+          "run": "python3 -I -B scripts/verify_hosted.py prepare",
+          "env": {
+            "REPO_PLATFORM_SKILLS_ROOT": "${{ runner.temp }}/repo-platform-skills-index"
+          }
+        },
+        {
+          "name": "Test recovery",
+          "id": "verify",
+          "run": "python3 -I -B scripts/verify_hosted.py shard --shard recovery",
+          "env": {
+            "REPO_PLATFORM_SKILLS_ROOT": "${{ runner.temp }}/repo-platform-skills-index"
+          }
+        }
+      ]
+    },
+    "ci-required": {
+      "name": "ci-required",
+      "if": "${{ always() }}",
+      "needs": [
+        "adoption",
+        "recovery"
+      ],
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 5,
+      "env": {
+        "CI_HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+        "CI_BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+        "REPO_PLATFORM_DEV_ROOT": "${{ github.workspace }}/_ci-dev",
+        "CI_NEEDS": "${{ toJSON(needs) }}"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": false,
+            "fetch-depth": 0
+          }
+        },
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "ref": "a74471e4692919970a7df54ab01534fe74e6c81a",
+            "persist-credentials": false,
+            "fetch-depth": 1,
+            "repository": "KleinPerkins/dev",
+            "path": "_ci-dev"
+          }
+        },
+        {
+          "uses": "actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c",
+          "with": {
+            "python-version": "3.12.12"
+          }
+        },
+        {
+          "name": "Verify both exact-run receipts",
+          "run": "python3 -I -B scripts/verify_hosted.py aggregate"
+        }
+      ]
+    }
+  }
+}
